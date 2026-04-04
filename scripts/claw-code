@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python3)}"
+RUST_BIN="$ROOT_DIR/rust/target/release/claw"
+
+if [[ ! -x "$PYTHON_BIN" ]]; then
+  echo "python3 not found in PATH" >&2
+  exit 1
+fi
+
+if [[ -x "$RUST_BIN" ]]; then
+  exec "$RUST_BIN" "$@"
+fi
+
+if [[ "${1:-}" == "--version" ]]; then
+  GIT_SHA="unknown"
+  if command -v git >/dev/null 2>&1; then
+    GIT_SHA="$(git -C "$ROOT_DIR" rev-parse --short HEAD 2>/dev/null || printf 'unknown')"
+  fi
+  printf 'claw-code parity %s\n' "$GIT_SHA"
+  exit 0
+fi
+
+cd "$ROOT_DIR"
+
+if [[ $# -eq 0 ]]; then
+  exec "$PYTHON_BIN" -m src.main summary
+fi
+
+exec "$PYTHON_BIN" -m src.main "$@"
