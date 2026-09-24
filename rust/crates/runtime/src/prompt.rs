@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::json::JsonValue;
 use crate::memory::MemoryStore;
 
 #[derive(Debug)]
@@ -438,8 +439,85 @@ fn render_config_section(config: &RuntimeConfig) -> String {
             .collect(),
     ));
     lines.push(String::new());
-    lines.push(config.as_json().render());
+    // The prompt goes to the model provider on every request and the model can repeat it,
+    // so settings values that hold or can hold credentials never enter it.
+    lines.push(redact_config_secrets(&config.as_json()).render());
     lines.join("\n")
+}
+
+const REDACTED: &str = "[redacted]";
+
+fn redact_config_secrets(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(entries) => JsonValue::Object(
+            entries
+                .iter()
+                .map(|(key, value)| {
+                    let redacted = if is_secret_bearing_key(key) {
+                        redact_strings(value)
+                    } else if key.eq_ignore_ascii_case("url") {
+                        redact_url_query(value)
+                    } else {
+                        redact_config_secrets(value)
+                    };
+                    (key.clone(), redacted)
+                })
+                .collect(),
+        ),
+        JsonValue::Array(values) => {
+            JsonValue::Array(values.iter().map(redact_config_secrets).collect())
+        }
+        other => other.clone(),
+    }
+}
+
+/// Settings keys whose string values are, or can carry, credentials: environment variables,
+/// request headers and header helpers, OAuth data, command-line arguments and anything named
+/// like a token, secret or password.
+fn is_secret_bearing_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    matches!(
+        key.as_str(),
+        "env" | "headers" | "headershelper" | "oauth" | "args"
+    ) || [
+        "token",
+        "secret",
+        "password",
+        "apikey",
+        "api_key",
+        "credential",
+        "authorization",
+        "cookie",
+    ]
+    .iter()
+    .any(|needle| key.contains(needle))
+}
+
+/// Replaces every string below a secret-bearing key. Object keys (variable and header names)
+/// and non-string values stay visible.
+fn redact_strings(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::String(_) => JsonValue::String(REDACTED.to_string()),
+        JsonValue::Array(values) => JsonValue::Array(values.iter().map(redact_strings).collect()),
+        JsonValue::Object(entries) => JsonValue::Object(
+            entries
+                .iter()
+                .map(|(key, value)| (key.clone(), redact_strings(value)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+/// Query strings and fragments of configured URLs often carry API keys.
+fn redact_url_query(value: &JsonValue) -> JsonValue {
+    match value {
+        JsonValue::String(url) => match url.find(['?', '#']) {
+            Some(index) => JsonValue::String(format!("{}{REDACTED}", &url[..=index])),
+            None => value.clone(),
+        },
+        other => redact_config_secrets(other),
+    }
 }
 
 fn get_simple_intro_section(has_output_style: bool) -> String {
@@ -819,6 +897,68 @@ mod tests {
         assert!(prompt.contains(SYSTEM_PROMPT_DYNAMIC_BOUNDARY));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn runtime_config_section_redacts_secrets_but_keeps_settings() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".claw")).expect("claw dir");
+        fs::write(
+            root.join(".claw").join("settings.json"),
+            r#"{
+              "permissionMode": "acceptEdits",
+              "model": "opus",
+              "maxTokens": 4096,
+              "env": {"GITHUB_TOKEN": "ghp_env_secret"},
+              "githubToken": "top_level_secret",
+              "oauth": {
+                "clientId": "oauth_client_secret",
+                "authorizeUrl": "https://auth.example/authorize",
+                "tokenUrl": "https://auth.example/token"
+              },
+              "mcpServers": {
+                "github": {
+                  "command": "gh-mcp",
+                  "args": ["--token", "args_secret"],
+                  "env": {"GITHUB_TOKEN": "mcp_env_secret"}
+                },
+                "remote": {
+                  "type": "http",
+                  "url": "https://mcp.example/sse?api_key=url_secret",
+                  "headers": {"Authorization": "Bearer header_secret"},
+                  "headersHelper": "print-token --key helper_secret"
+                }
+              }
+            }"#,
+        )
+        .expect("write settings");
+        let config = ConfigLoader::new(&root, root.join("missing-home"))
+            .load()
+            .expect("config should load");
+
+        let prompt = SystemPromptBuilder::new()
+            .with_runtime_config(config)
+            .render();
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+
+        for secret in [
+            "ghp_env_secret",
+            "top_level_secret",
+            "oauth_client_secret",
+            "args_secret",
+            "mcp_env_secret",
+            "url_secret",
+            "header_secret",
+            "helper_secret",
+        ] {
+            assert!(!prompt.contains(secret), "{secret} leaked into: {prompt}");
+        }
+        assert!(prompt.contains(r#""permissionMode":"acceptEdits""#));
+        assert!(prompt.contains(r#""model":"opus""#));
+        assert!(prompt.contains(r#""maxTokens":4096"#));
+        assert!(prompt.contains(r#""GITHUB_TOKEN":"[redacted]""#));
+        assert!(prompt.contains(r#""command":"gh-mcp""#));
+        assert!(prompt.contains("https://mcp.example/sse?[redacted]"));
     }
 
     #[test]
