@@ -5,6 +5,7 @@ use std::path::Path;
 
 use crate::file_ops::is_path_within_workspace;
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
+use crate::shell_split::{basename, split_simple_commands};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,84 +147,66 @@ fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
 }
 
 /// Conservative heuristic: is this bash command read-only?
+///
+/// Every simple command in the line must start with a binary that can
+/// neither write files nor run other programs, and the line must not use
+/// redirections, expansions or subshells (see
+/// `shell_split::split_simple_commands`). Binaries that can write or execute
+/// through their options (`tee`, `xargs`, `env`, `find -delete`, `sed -i`,
+/// `awk` `system()`, `sort -o`, `git`, interpreters, ...) are not listed.
 fn is_read_only_command(command: &str) -> bool {
-    let first_token = command
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-
-    matches!(
-        first_token,
-        "cat"
-            | "head"
-            | "tail"
-            | "less"
-            | "more"
-            | "wc"
-            | "ls"
-            | "find"
-            | "grep"
-            | "rg"
-            | "awk"
-            | "sed"
-            | "echo"
-            | "printf"
-            | "which"
-            | "where"
-            | "whoami"
-            | "pwd"
-            | "env"
-            | "printenv"
-            | "date"
-            | "cal"
-            | "df"
-            | "du"
-            | "free"
-            | "uptime"
-            | "uname"
-            | "file"
-            | "stat"
-            | "diff"
-            | "sort"
-            | "uniq"
-            | "tr"
-            | "cut"
-            | "paste"
-            | "tee"
-            | "xargs"
-            | "test"
-            | "true"
-            | "false"
-            | "type"
-            | "readlink"
-            | "realpath"
-            | "basename"
-            | "dirname"
-            | "sha256sum"
-            | "md5sum"
-            | "b3sum"
-            | "xxd"
-            | "hexdump"
-            | "od"
-            | "strings"
-            | "tree"
-            | "jq"
-            | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
-            | "git"
-            | "gh"
-    ) && !command.contains("-i ")
-        && !command.contains("--in-place")
-        && !command.contains(" > ")
-        && !command.contains(" >> ")
+    let Some(commands) = split_simple_commands(command) else {
+        return false;
+    };
+    !commands.is_empty()
+        && commands.iter().all(|words| {
+            words.first().is_some_and(|program| {
+                matches!(
+                    basename(program),
+                    "cat"
+                        | "head"
+                        | "tail"
+                        | "more"
+                        | "wc"
+                        | "ls"
+                        | "grep"
+                        | "echo"
+                        | "printf"
+                        | "which"
+                        | "where"
+                        | "whoami"
+                        | "pwd"
+                        | "printenv"
+                        | "date"
+                        | "cal"
+                        | "df"
+                        | "du"
+                        | "free"
+                        | "uptime"
+                        | "uname"
+                        | "stat"
+                        | "diff"
+                        | "tr"
+                        | "cut"
+                        | "paste"
+                        | "test"
+                        | "true"
+                        | "false"
+                        | "type"
+                        | "readlink"
+                        | "realpath"
+                        | "basename"
+                        | "dirname"
+                        | "sha256sum"
+                        | "md5sum"
+                        | "b3sum"
+                        | "hexdump"
+                        | "od"
+                        | "strings"
+                        | "jq"
+                )
+            })
+        })
 }
 
 #[cfg(test)]
@@ -388,10 +371,36 @@ mod tests {
     fn read_only_command_heuristic() {
         assert!(is_read_only_command("cat file.txt"));
         assert!(is_read_only_command("grep pattern file"));
-        assert!(is_read_only_command("git log --oneline"));
+        // git can push, commit, rewrite config or run hooks, so its first
+        // token alone does not make a command read-only.
+        assert!(!is_read_only_command("git log --oneline"));
         assert!(!is_read_only_command("rm file.txt"));
         assert!(!is_read_only_command("echo test > file.txt"));
         assert!(!is_read_only_command("sed -i 's/a/b/' file"));
+    }
+
+    #[test]
+    fn read_only_heuristic_rejects_writers_and_chained_commands() {
+        for command in [
+            "tee ~/.bashrc",
+            "git push -f",
+            "python3 -c 'open(\"x\", \"w\").write(\"pwned\")'",
+            "cat x; rm -rf y",
+            "cat x && rm -rf y",
+            "cat x | xargs rm",
+            "find . -delete",
+            "sort -o out.txt in.txt",
+            "env rm -rf y",
+            "awk 'BEGIN { system(\"rm -rf y\") }'",
+            "cat $(rm -rf y)",
+            "grep -r pattern . >> out.txt",
+        ] {
+            assert!(
+                !is_read_only_command(command),
+                "{command:?} must not count as read-only"
+            );
+        }
+        assert!(is_read_only_command("cat Cargo.toml | grep -i version"));
     }
 
     #[test]
@@ -496,15 +505,15 @@ mod tests {
     fn bash_heuristic_full_path_prefix() {
         // given
         let full_path_command = "/usr/bin/cat Cargo.toml";
-        let git_path_command = "/usr/local/bin/git status";
+        let grep_path_command = "/usr/local/bin/grep -n main src/lib.rs";
 
         // when
         let cat_result = is_read_only_command(full_path_command);
-        let git_result = is_read_only_command(git_path_command);
+        let grep_result = is_read_only_command(grep_path_command);
 
         // then
         assert!(cat_result);
-        assert!(git_result);
+        assert!(grep_result);
     }
 
     #[test]
