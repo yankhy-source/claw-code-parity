@@ -130,8 +130,8 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "memory",
         aliases: &[],
-        summary: "Inspect loaded Claude instruction memory files",
-        argument_hint: None,
+        summary: "Inspect instruction files and durable memory, or add/search/forget notes",
+        argument_hint: Some("[list [project|user]|search <query>|add <note>|forget <id>|help]"),
         resume_supported: true,
     },
     SlashCommandSpec {
@@ -1084,7 +1084,10 @@ pub enum SlashCommand {
         action: Option<String>,
         target: Option<String>,
     },
-    Memory,
+    Memory {
+        action: Option<String>,
+        target: Option<String>,
+    },
     Init,
     Diff,
     Version,
@@ -1283,10 +1286,7 @@ pub fn validate_slash_command_input(
             section: parse_config_section(&args)?,
         },
         "mcp" => parse_mcp_command(&args)?,
-        "memory" => {
-            validate_no_args(command, &args)?;
-            SlashCommand::Memory
-        }
+        "memory" => parse_memory_command(&args)?,
         "init" => {
             validate_no_args(command, &args)?;
             SlashCommand::Init
@@ -1576,6 +1576,36 @@ fn parse_mcp_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseErr
             &format!("Unknown /mcp action '{action}'. Use list, show <server>, or help."),
             "mcp",
             "/mcp [list|show <server>|help]",
+        )),
+    }
+}
+
+fn parse_memory_command(args: &[&str]) -> Result<SlashCommand, SlashCommandParseError> {
+    let memory = |action: &str, target: Option<String>| SlashCommand::Memory {
+        action: Some(action.to_string()),
+        target,
+    };
+    match args {
+        [] => Ok(SlashCommand::Memory {
+            action: None,
+            target: None,
+        }),
+        ["list"] => Ok(memory("list", None)),
+        ["list", scope @ ("project" | "user")] => Ok(memory("list", Some((*scope).to_string()))),
+        ["list", ..] => Err(usage_error("memory list", "[project|user]")),
+        ["search" | "recall"] => Err(usage_error("memory search", "<query>")),
+        ["search" | "recall", query @ ..] => Ok(memory("search", Some(query.join(" ")))),
+        ["add" | "remember"] => Err(usage_error("memory add", "<note>")),
+        ["add" | "remember", note @ ..] => Ok(memory("add", Some(note.join(" ")))),
+        ["forget", id] => Ok(memory("forget", Some((*id).to_string()))),
+        ["forget", ..] => Err(usage_error("memory forget", "<id>")),
+        ["help" | "-h" | "--help"] => Ok(memory("help", None)),
+        [action, ..] => Err(command_error(
+            &format!(
+                "Unknown /memory action '{action}'. Use list, search <query>, add <note>, forget <id>, or help."
+            ),
+            "memory",
+            "/memory [list [project|user]|search <query>|add <note>|forget <id>|help]",
         )),
     }
 }
@@ -3205,7 +3235,7 @@ pub fn handle_slash_command(
         | SlashCommand::Resume { .. }
         | SlashCommand::Config { .. }
         | SlashCommand::Mcp { .. }
-        | SlashCommand::Memory
+        | SlashCommand::Memory { .. }
         | SlashCommand::Init
         | SlashCommand::Diff
         | SlashCommand::Version
@@ -3487,8 +3517,49 @@ mod tests {
         );
         assert_eq!(
             SlashCommand::parse("/memory"),
-            Ok(Some(SlashCommand::Memory))
+            Ok(Some(SlashCommand::Memory {
+                action: None,
+                target: None
+            }))
         );
+        assert_eq!(
+            SlashCommand::parse("/memory search  release   steps"),
+            Ok(Some(SlashCommand::Memory {
+                action: Some("search".to_string()),
+                target: Some("release steps".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/memory add Deploys run via deploy.sh"),
+            Ok(Some(SlashCommand::Memory {
+                action: Some("add".to_string()),
+                target: Some("Deploys run via deploy.sh".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/memory list user"),
+            Ok(Some(SlashCommand::Memory {
+                action: Some("list".to_string()),
+                target: Some("user".to_string())
+            }))
+        );
+        assert_eq!(
+            SlashCommand::parse("/memory forget mem-1-abc"),
+            Ok(Some(SlashCommand::Memory {
+                action: Some("forget".to_string()),
+                target: Some("mem-1-abc".to_string())
+            }))
+        );
+        for invalid in [
+            "/memory add",
+            "/memory search",
+            "/memory forget",
+            "/memory forget a b",
+            "/memory list team",
+            "/memory purge",
+        ] {
+            assert!(SlashCommand::parse(invalid).is_err(), "{invalid}");
+        }
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
         assert_eq!(SlashCommand::parse("/diff"), Ok(Some(SlashCommand::Diff)));
         assert_eq!(

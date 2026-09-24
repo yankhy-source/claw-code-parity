@@ -83,6 +83,7 @@ Primary artifacts:
 | Todo tracking | ✅ |
 | Notebook editing | ✅ |
 | CLAUDE.md / project memory | ✅ |
+| Durable cross-session memory (MemoryRecall / MemoryWrite, `/memory`) | ✅ |
 | Config file hierarchy (.claude.json) | ✅ |
 | Permission system | ✅ |
 | MCP server lifecycle | ✅ |
@@ -96,6 +97,15 @@ Primary artifacts:
 | Hooks (PreToolUse/PostToolUse) | 🔧 Config only |
 | Plugin system | 📋 Planned |
 | Skills registry | 📋 Planned |
+
+## Durable Memory
+
+Claw keeps durable notes that survive sessions and are shared by every worker and sub-agent:
+
+- **Project scope** — `<repo>/.claw/memory/` (git worktrees share their main checkout's memory). Commit it to share team knowledge, or add it to `.gitignore` to keep it local.
+- **User scope** — `$CLAW_CONFIG_HOME/memory/` (default `~/.claw/memory/`), personal notes that follow you across projects.
+
+Each note is a small Markdown file with a `key: value` header (`id`, `kind`, `tags`, `pinned`, `created`), so you can read, edit, or delete notes by hand. Pinned notes and the newest notes are injected into the system prompt under `# Memory` (bounded to 6,000 characters; set `CLAW_DISABLE_MEMORY=1` to turn injection off). The model searches with `MemoryRecall` (read-only) and saves or deletes notes with `MemoryWrite` (workspace-write). Content that looks like a credential (API keys, private keys, `password: …`) is refused, and duplicate notes are collapsed.
 
 ## Model Aliases
 
@@ -143,7 +153,7 @@ Tab completion now expands not just slash command names, but also common workflo
 | `/model [name]` | Show or switch model |
 | `/permissions` | Show or switch permission mode |
 | `/config [section]` | Show config (env, hooks, model) |
-| `/memory` | Show CLAUDE.md contents |
+| `/memory [list\|search <q>\|add <note>\|forget <id>]` | Show instruction files and durable memory; add, search, or forget notes |
 | `/diff` | Show git diff |
 | `/export [path]` | Export conversation |
 | `/session [id]` | Resume a previous session |

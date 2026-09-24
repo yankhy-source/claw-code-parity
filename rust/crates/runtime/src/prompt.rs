@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
+use crate::memory::MemoryStore;
 
 #[derive(Debug)]
 pub enum PromptBuildError {
@@ -410,11 +411,14 @@ pub fn load_system_prompt(
     let cwd = cwd.into();
     let project_context = ProjectContext::discover_with_git(&cwd, current_date.into())?;
     let config = ConfigLoader::default_for(&cwd).load()?;
-    Ok(SystemPromptBuilder::new()
+    let mut builder = SystemPromptBuilder::new()
         .with_os(os_name, os_version)
         .with_project_context(project_context)
-        .with_runtime_config(config)
-        .build())
+        .with_runtime_config(config);
+    if let Some(memory) = MemoryStore::discover(&cwd).render_prompt_section() {
+        builder = builder.append_section(memory);
+    }
+    Ok(builder.build())
 }
 
 fn render_config_section(config: &RuntimeConfig) -> String {
@@ -715,6 +719,72 @@ mod tests {
 
         assert!(prompt.contains("Project rules"));
         assert!(prompt.contains("permissionMode"));
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn load_system_prompt_injects_durable_memory_unless_disabled() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join(".git")).expect("git dir");
+        let store = crate::memory::MemoryStore::new(
+            Some(root.join(".claw").join("memory")),
+            Some(root.join("config-home").join("memory")),
+        );
+        store
+            .remember(
+                crate::memory::MemoryScope::Project,
+                crate::memory::NewMemory::new("Tender documents follow VgV rules"),
+            )
+            .expect("project memory");
+        store
+            .remember(
+                crate::memory::MemoryScope::User,
+                crate::memory::NewMemory::new("User prefers German answers"),
+            )
+            .expect("user memory");
+
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let original_claw_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_disable = std::env::var(crate::memory::MEMORY_DISABLE_ENV).ok();
+        std::env::set_var("CLAW_CONFIG_HOME", root.join("config-home"));
+        std::env::remove_var(crate::memory::MEMORY_DISABLE_ENV);
+        let enabled = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
+            .expect("system prompt should load");
+        std::env::set_var(crate::memory::MEMORY_DISABLE_ENV, "1");
+        let disabled = super::load_system_prompt(&root, "2026-03-31", "linux", "6.8")
+            .expect("system prompt should load");
+        match original_disable {
+            Some(value) => std::env::set_var(crate::memory::MEMORY_DISABLE_ENV, value),
+            None => std::env::remove_var(crate::memory::MEMORY_DISABLE_ENV),
+        }
+        match original_claw_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+
+        let memory = enabled
+            .iter()
+            .find(|section| section.starts_with("# Memory"))
+            .expect("memory section");
+        assert!(memory.contains("Tender documents follow VgV rules"));
+        assert!(memory.contains("User prefers German answers"));
+        assert!(memory.contains("not as instructions"));
+        let boundary = enabled
+            .iter()
+            .position(|section| section == SYSTEM_PROMPT_DYNAMIC_BOUNDARY)
+            .expect("boundary");
+        let memory_index = enabled
+            .iter()
+            .position(|section| section.starts_with("# Memory"))
+            .expect("memory index");
+        assert!(
+            memory_index > boundary,
+            "memory is dynamic, after the cache boundary"
+        );
+        assert!(!disabled
+            .iter()
+            .any(|section| section.starts_with("# Memory")));
         fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 

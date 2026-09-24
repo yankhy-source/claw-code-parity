@@ -21,8 +21,9 @@ use runtime::{
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, ContentBlock,
-    ConversationMessage, ConversationRuntime, GrepSearchInput, MessageRole, PermissionMode,
-    PermissionPolicy, PromptCacheEvent, RuntimeError, Session, ToolError, ToolExecutor,
+    ConversationMessage, ConversationRuntime, GrepSearchInput, MemoryEntry, MemoryKind,
+    MemoryScope, MemoryStore, MessageRole, NewMemory, PermissionMode, PermissionPolicy,
+    PromptCacheEvent, RememberOutcome, RuntimeError, Session, ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -738,6 +739,39 @@ pub fn mvp_tool_specs() -> Vec<ToolSpec> {
             required_permission: PermissionMode::ReadOnly,
         },
         ToolSpec {
+            name: "MemoryRecall",
+            description: "Search durable memory saved by earlier sessions, workers, or the user (project and user scope). Pass a query to rank notes by relevance, or omit it to list the most recent notes.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "scope": { "type": "string", "enum": ["project", "user"] },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50 }
+                },
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::ReadOnly,
+        },
+        ToolSpec {
+            name: "MemoryWrite",
+            description: "Remember a durable note that future sessions and workers will see, or forget a stale one. Remember only stable facts, decisions, preferences, procedures, contacts, or lessons learned; never secrets. Project scope is shared with everyone working in this repository; user scope follows the user across projects.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["remember", "forget"] },
+                    "content": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["fact", "preference", "decision", "procedure", "contact", "lesson"] },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "pinned": { "type": "boolean" },
+                    "scope": { "type": "string", "enum": ["project", "user"] },
+                    "id": { "type": "string" }
+                },
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+            required_permission: PermissionMode::WorkspaceWrite,
+        },
+        ToolSpec {
             name: "TaskCreate",
             description: "Create a background task that runs in a separate subprocess.",
             input_schema: json!({
@@ -1172,6 +1206,8 @@ fn execute_tool_with_enforcer(
         "AskUserQuestion" => {
             from_value::<AskUserQuestionInput>(input).and_then(run_ask_user_question)
         }
+        "MemoryRecall" => from_value::<MemoryRecallInput>(input).and_then(run_memory_recall),
+        "MemoryWrite" => from_value::<MemoryWriteInput>(input).and_then(run_memory_write),
         "TaskCreate" => from_value::<TaskCreateInput>(input).and_then(run_task_create),
         "TaskGet" => from_value::<TaskIdInput>(input).and_then(run_task_get),
         "TaskList" => run_task_list(input.clone()),
@@ -1270,6 +1306,133 @@ fn run_ask_user_question(input: AskUserQuestionInput) -> Result<String, String> 
         "answer": answer,
         "status": "answered"
     }))
+}
+
+const DEFAULT_MEMORY_RECALL_LIMIT: usize = 10;
+
+fn workspace_memory_store() -> Result<MemoryStore, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    Ok(MemoryStore::discover(&cwd))
+}
+
+fn parse_memory_scope(scope: Option<&str>) -> Result<Option<MemoryScope>, String> {
+    scope
+        .map(|scope| {
+            scope
+                .parse::<MemoryScope>()
+                .map_err(|error| error.to_string())
+        })
+        .transpose()
+}
+
+fn memory_entry_json(entry: &MemoryEntry, score: Option<f64>) -> Value {
+    let mut value = json!({
+        "id": entry.id,
+        "scope": entry.scope.as_str(),
+        "kind": entry.kind.as_str(),
+        "tags": entry.tags,
+        "pinned": entry.pinned,
+        "created_at": entry.created_at,
+        "source": entry.source,
+        "content": entry.content,
+        "path": entry.path.display().to_string(),
+    });
+    if let Some(score) = score {
+        value["score"] = json!((score * 1000.0).round() / 1000.0);
+    }
+    value
+}
+
+#[allow(clippy::needless_pass_by_value)]
+fn run_memory_recall(input: MemoryRecallInput) -> Result<String, String> {
+    let store = workspace_memory_store()?;
+    let scope = parse_memory_scope(input.scope.as_deref())?;
+    let limit = input
+        .limit
+        .unwrap_or(DEFAULT_MEMORY_RECALL_LIMIT)
+        .clamp(1, 50);
+    let query = input
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|query| !query.is_empty());
+    let results: Vec<Value> = match query {
+        Some(query) => store
+            .recall(query, scope, limit)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .map(|scored| memory_entry_json(&scored.entry, Some(scored.score)))
+            .collect(),
+        None => store
+            .list(scope)
+            .map_err(|error| error.to_string())?
+            .iter()
+            .take(limit)
+            .map(|entry| memory_entry_json(entry, None))
+            .collect(),
+    };
+    to_pretty_json(json!({
+        "query": query,
+        "scope": scope.map(MemoryScope::as_str),
+        "count": results.len(),
+        "results": results,
+        "project_dir": store.dir(MemoryScope::Project).map(|dir| dir.display().to_string()),
+        "user_dir": store.dir(MemoryScope::User).map(|dir| dir.display().to_string()),
+    }))
+}
+
+fn run_memory_write(input: MemoryWriteInput) -> Result<String, String> {
+    let store = workspace_memory_store()?;
+    match input.action.as_str() {
+        "remember" => {
+            let content = input
+                .content
+                .filter(|content| !content.trim().is_empty())
+                .ok_or_else(|| "MemoryWrite remember requires non-empty content".to_string())?;
+            let scope = parse_memory_scope(input.scope.as_deref())?.unwrap_or(MemoryScope::Project);
+            let kind = input
+                .kind
+                .as_deref()
+                .map(str::parse::<MemoryKind>)
+                .transpose()
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            let outcome = store
+                .remember(
+                    scope,
+                    NewMemory {
+                        content,
+                        kind,
+                        tags: input.tags.unwrap_or_default(),
+                        pinned: input.pinned.unwrap_or(false),
+                        source: None,
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+            let status = match &outcome {
+                RememberOutcome::Created(_) => "created",
+                RememberOutcome::Duplicate(_) => "duplicate",
+            };
+            to_pretty_json(json!({
+                "status": status,
+                "memory": memory_entry_json(outcome.entry(), None),
+            }))
+        }
+        "forget" => {
+            let id = input
+                .id
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| "MemoryWrite forget requires an id".to_string())?;
+            let entry = store.forget(&id).map_err(|error| error.to_string())?;
+            to_pretty_json(json!({
+                "status": "forgotten",
+                "memory": memory_entry_json(&entry, None),
+            }))
+        }
+        other => Err(format!(
+            "unsupported MemoryWrite action '{other}' (expected remember or forget)"
+        )),
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)]
@@ -1971,6 +2134,33 @@ struct AskUserQuestionInput {
     question: String,
     #[serde(default)]
     options: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryRecallInput {
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MemoryWriteInput {
+    action: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+    #[serde(default)]
+    pinned: Option<bool>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3044,6 +3234,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "Skill",
+            "MemoryRecall",
             "StructuredOutput",
         ],
         "Plan" => vec![
@@ -3055,6 +3246,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "ToolSearch",
             "Skill",
             "TodoWrite",
+            "MemoryRecall",
             "StructuredOutput",
             "SendUserMessage",
         ],
@@ -3067,6 +3259,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "TodoWrite",
+            "MemoryRecall",
             "StructuredOutput",
             "SendUserMessage",
             "PowerShell",
@@ -3079,6 +3272,7 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "WebSearch",
             "ToolSearch",
             "Skill",
+            "MemoryRecall",
             "StructuredOutput",
             "SendUserMessage",
         ],
@@ -3107,6 +3301,8 @@ fn allowed_tools_for_subagent(subagent_type: &str) -> BTreeSet<String> {
             "Sleep",
             "SendUserMessage",
             "Config",
+            "MemoryRecall",
+            "MemoryWrite",
             "StructuredOutput",
             "REPL",
             "PowerShell",
@@ -4873,6 +5069,132 @@ mod tests {
             .fold(PermissionPolicy::new(mode), |policy, spec| {
                 policy.with_tool_requirement(spec.name, spec.required_permission)
             })
+    }
+
+    #[test]
+    fn memory_tools_remember_recall_and_forget_durably() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("memory-tools");
+        let project = root.join("project");
+        let config_home = root.join("config-home");
+        std::fs::create_dir_all(project.join(".git")).expect("project repo");
+        std::fs::create_dir_all(project.join("src")).expect("project src");
+        let original_dir = std::env::current_dir().expect("cwd");
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::set_current_dir(project.join("src")).expect("set cwd");
+
+        let remembered: serde_json::Value = serde_json::from_str(
+            &execute_tool(
+                "MemoryWrite",
+                &json!({
+                    "action": "remember",
+                    "content": "Release builds are published with scripts/release.sh",
+                    "kind": "procedure",
+                    "tags": ["release"]
+                }),
+            )
+            .expect("remember should succeed"),
+        )
+        .expect("json");
+        assert_eq!(remembered["status"], "created");
+        assert_eq!(remembered["memory"]["scope"], "project");
+        let id = remembered["memory"]["id"].as_str().expect("id").to_string();
+        let path = PathBuf::from(remembered["memory"]["path"].as_str().expect("path"));
+        assert!(path.starts_with(project.join(".claw").join("memory")));
+
+        execute_tool(
+            "MemoryWrite",
+            &json!({"action": "remember", "content": "Prefers concise German answers", "scope": "user", "pinned": true}),
+        )
+        .expect("user memory");
+        let duplicate: serde_json::Value = serde_json::from_str(
+            &execute_tool(
+                "MemoryWrite",
+                &json!({"action": "remember", "content": "release builds are published with scripts/release.sh"}),
+            )
+            .expect("duplicate remember"),
+        )
+        .expect("json");
+        assert_eq!(duplicate["status"], "duplicate");
+        assert_eq!(duplicate["memory"]["id"], id.as_str());
+
+        let recalled: serde_json::Value = serde_json::from_str(
+            &execute_tool("MemoryRecall", &json!({"query": "how do we release?"}))
+                .expect("recall should succeed"),
+        )
+        .expect("json");
+        assert_eq!(recalled["count"], 1);
+        assert_eq!(recalled["results"][0]["id"], id.as_str());
+
+        let listed: serde_json::Value = serde_json::from_str(
+            &execute_tool("MemoryRecall", &json!({})).expect("list should succeed"),
+        )
+        .expect("json");
+        assert_eq!(listed["count"], 2);
+        assert_eq!(listed["results"][0]["scope"], "user", "pinned first");
+
+        let secret = execute_tool(
+            "MemoryWrite",
+            &json!({"action": "remember", "content": "api_key = sk-ant-api03-abcdefghijklmnopqrstu"}),
+        )
+        .expect_err("secrets must be rejected");
+        assert!(secret.contains("looks like a secret"));
+        assert!(execute_tool("MemoryWrite", &json!({"action": "remember"})).is_err());
+        assert!(execute_tool(
+            "MemoryWrite",
+            &json!({"action": "remember", "content": "x y", "kind": "rumor"})
+        )
+        .is_err());
+        assert!(execute_tool("MemoryRecall", &json!({"scope": "team"})).is_err());
+
+        let forgotten: serde_json::Value = serde_json::from_str(
+            &execute_tool("MemoryWrite", &json!({"action": "forget", "id": id}))
+                .expect("forget should succeed"),
+        )
+        .expect("json");
+        assert_eq!(forgotten["status"], "forgotten");
+        assert!(!path.exists());
+        assert!(execute_tool("MemoryWrite", &json!({"action": "forget", "id": "../x"})).is_err());
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn subagents_can_recall_memory_and_general_workers_can_write_it() {
+        for subagent in [
+            "Explore",
+            "Plan",
+            "Verification",
+            "claw-guide",
+            "general-purpose",
+        ] {
+            assert!(
+                super::allowed_tools_for_subagent(subagent).contains("MemoryRecall"),
+                "{subagent} should recall memory"
+            );
+        }
+        assert!(super::allowed_tools_for_subagent("general-purpose").contains("MemoryWrite"));
+        assert!(!super::allowed_tools_for_subagent("Explore").contains("MemoryWrite"));
+        let specs = mvp_tool_specs();
+        let permission = |name: &str| {
+            specs
+                .iter()
+                .find(|spec| spec.name == name)
+                .map(|spec| spec.required_permission)
+        };
+        assert_eq!(permission("MemoryRecall"), Some(PermissionMode::ReadOnly));
+        assert_eq!(
+            permission("MemoryWrite"),
+            Some(PermissionMode::WorkspaceWrite)
+        );
     }
 
     #[test]

@@ -43,10 +43,10 @@ use runtime::{
     parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
     save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
     ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager,
-    McpTool, MessageRole, ModelPricing, OAuthAuthorizationRequest, OAuthConfig,
-    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
-    ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError, ToolExecutor,
-    UsageTracker,
+    McpTool, MemoryEntry, MemoryScope, MemoryStore, MessageRole, ModelPricing, NewMemory,
+    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
+    PermissionPolicy, ProjectContext, PromptCacheEvent, RememberOutcome, ResolvedPermissionMode,
+    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -1416,9 +1416,12 @@ fn run_resume_command(
                 message: Some(handle_mcp_slash_command(args.as_deref(), &cwd)?),
             })
         }
-        SlashCommand::Memory => Ok(ResumeCommandOutcome {
+        SlashCommand::Memory { action, target } => Ok(ResumeCommandOutcome {
             session: session.clone(),
-            message: Some(render_memory_report()?),
+            message: Some(handle_memory_slash_command(
+                action.as_deref(),
+                target.as_deref(),
+            )?),
         }),
         SlashCommand::Init => Ok(ResumeCommandOutcome {
             session: session.clone(),
@@ -2288,8 +2291,8 @@ impl LiveCli {
                 Self::print_mcp(args.as_deref())?;
                 false
             }
-            SlashCommand::Memory => {
-                Self::print_memory()?;
+            SlashCommand::Memory { action, target } => {
+                Self::print_memory(action.as_deref(), target.as_deref())?;
                 false
             }
             SlashCommand::Init => {
@@ -2589,8 +2592,11 @@ impl LiveCli {
         Ok(())
     }
 
-    fn print_memory() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", render_memory_report()?);
+    fn print_memory(
+        action: Option<&str>,
+        target: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        println!("{}", handle_memory_slash_command(action, target)?);
         Ok(())
     }
 
@@ -3418,10 +3424,141 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
             ));
         }
     }
+    lines.extend(render_durable_memory_summary(&MemoryStore::discover(&cwd)));
     Ok(lines.join(
         "
 ",
     ))
+}
+
+const MEMORY_COMMAND_USAGE: &str =
+    "/memory [list [project|user]|search <query>|add <note>|forget <id>|help]";
+
+fn render_durable_memory_summary(store: &MemoryStore) -> Vec<String> {
+    let dir = |scope: MemoryScope| {
+        store.dir(scope).map_or_else(
+            || "<unavailable>".to_string(),
+            |dir| dir.display().to_string(),
+        )
+    };
+    let mut lines = vec![
+        "Durable memory".to_string(),
+        format!("  Project dir       {}", dir(MemoryScope::Project)),
+        format!("  User dir          {}", dir(MemoryScope::User)),
+    ];
+    match store.list(None) {
+        Ok(entries) => {
+            let pinned = entries.iter().filter(|entry| entry.pinned).count();
+            let project = entries
+                .iter()
+                .filter(|entry| entry.scope == MemoryScope::Project)
+                .count();
+            lines.push(format!(
+                "  Entries           project={project} user={} pinned={pinned}",
+                entries.len() - project
+            ));
+            for entry in entries.iter().take(5) {
+                lines.push(format!("    {}", format_memory_entry_line(entry)));
+            }
+        }
+        Err(error) => lines.push(format!("  Entries           unavailable ({error})")),
+    }
+    lines.push(format!("  Commands          {MEMORY_COMMAND_USAGE}"));
+    lines
+}
+
+fn format_memory_entry_line(entry: &MemoryEntry) -> String {
+    let mut headline = entry.headline().to_string();
+    if headline.chars().count() > 100 {
+        headline = headline.chars().take(99).collect::<String>() + "…";
+    }
+    format!(
+        "[{}] ({}, {}{}) {}",
+        entry.id,
+        entry.scope,
+        entry.kind,
+        if entry.pinned { ", pinned" } else { "" },
+        headline
+    )
+}
+
+fn handle_memory_slash_command(
+    action: Option<&str>,
+    target: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let Some(action) = action else {
+        return render_memory_report();
+    };
+    let cwd = env::current_dir()?;
+    let store = MemoryStore::discover(&cwd);
+    let target = target.map(str::trim).filter(|target| !target.is_empty());
+    match (action, target) {
+        ("list", scope) => {
+            let scope = scope.map(str::parse::<MemoryScope>).transpose()?;
+            let entries = store.list(scope)?;
+            let mut lines = vec![format!(
+                "Memory entries ({}{})",
+                entries.len(),
+                scope.map_or_else(String::new, |scope| format!(", {scope} scope"))
+            )];
+            if entries.is_empty() {
+                lines.push("  No durable memory yet. Add one with /memory add <note>.".to_string());
+            }
+            lines.extend(
+                entries
+                    .iter()
+                    .map(|entry| format!("  {}", format_memory_entry_line(entry))),
+            );
+            Ok(lines.join("\n"))
+        }
+        ("search", Some(query)) => {
+            let results = store.recall(query, None, 10)?;
+            let mut lines = vec![format!("Memory search \"{query}\" ({} hits)", results.len())];
+            if results.is_empty() {
+                lines.push("  No matching memory.".to_string());
+            }
+            lines.extend(results.iter().map(|scored| {
+                format!(
+                    "  {:>5.2}  {}",
+                    scored.score,
+                    format_memory_entry_line(&scored.entry)
+                )
+            }));
+            Ok(lines.join("\n"))
+        }
+        ("add", Some(note)) => {
+            let outcome = store.remember(
+                MemoryScope::Project,
+                NewMemory {
+                    source: Some("/memory add".to_string()),
+                    ..NewMemory::new(note)
+                },
+            )?;
+            let verb = match outcome {
+                RememberOutcome::Created(_) => "Remembered",
+                RememberOutcome::Duplicate(_) => "Already remembered",
+            };
+            let entry = outcome.entry();
+            Ok(format!(
+                "{verb} [{}] in {} memory\n  File              {}",
+                entry.id,
+                entry.scope,
+                entry.path.display()
+            ))
+        }
+        ("forget", Some(id)) => {
+            let entry = store.forget(id)?;
+            Ok(format!(
+                "Forgot [{}] ({} memory): {}",
+                entry.id,
+                entry.scope,
+                entry.headline()
+            ))
+        }
+        _ => Ok(format!(
+            "Memory\n  Usage             {MEMORY_COMMAND_USAGE}\n  list              Show durable notes (pinned first, newest next)\n  search <query>    Rank notes by relevance\n  add <note>        Remember a project note for every future session and worker\n  forget <id>       Delete a note"
+        )),
+    }
 }
 
 fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
@@ -5576,11 +5713,12 @@ mod tests {
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, normalize_permission_mode, parse_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_memory_report, render_repl_help,
-        render_resume_usage, resolve_model_alias, resolve_session_reference, response_to_events,
+        format_unknown_slash_command_message, handle_memory_slash_command,
+        normalize_permission_mode, parse_args, parse_git_status_branch,
+        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
+        print_help_to, push_output_block, render_config_report, render_diff_report,
+        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
+        resolve_model_alias, resolve_session_reference, response_to_events,
         resume_supported_slash_commands, run_resume_command,
         slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
         write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
@@ -6774,7 +6912,10 @@ UU conflicted.rs",
         );
         assert_eq!(
             SlashCommand::parse("/memory"),
-            Ok(Some(SlashCommand::Memory))
+            Ok(Some(SlashCommand::Memory {
+                action: None,
+                target: None
+            }))
         );
         assert_eq!(SlashCommand::parse("/init"), Ok(Some(SlashCommand::Init)));
         assert_eq!(
@@ -6891,6 +7032,62 @@ UU conflicted.rs",
     fn cwd_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn memory_slash_command_adds_searches_lists_and_forgets_notes() {
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_workspace("memory-command");
+        std::fs::create_dir_all(workspace.join(".git")).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
+        std::env::set_var("CLAW_CONFIG_HOME", workspace.join("config-home"));
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let added = handle_memory_slash_command(Some("add"), Some("Vergabe PDFs live in aog-app"))
+            .expect("add should succeed");
+        assert!(added.starts_with("Remembered [mem-"), "{added}");
+        let again = handle_memory_slash_command(Some("add"), Some("vergabe pdfs live in AOG-APP"))
+            .expect("duplicate add should succeed");
+        assert!(again.starts_with("Already remembered"), "{again}");
+
+        let search = handle_memory_slash_command(Some("search"), Some("vergabe"))
+            .expect("search should succeed");
+        assert!(
+            search.contains("(1 hits)") && search.contains("aog-app"),
+            "{search}"
+        );
+        let id = search
+            .split('[')
+            .nth(1)
+            .and_then(|rest| rest.split(']').next())
+            .expect("id in search output")
+            .to_string();
+
+        let listed = handle_memory_slash_command(Some("list"), Some("project")).expect("list");
+        assert!(listed.contains(&id));
+        let report = handle_memory_slash_command(None, None).expect("report");
+        assert!(report.contains("Durable memory") && report.contains("project=1 user=0"));
+        assert!(handle_memory_slash_command(Some("list"), Some("team")).is_err());
+        assert!(
+            handle_memory_slash_command(Some("add"), Some("password: hunter2hunter2")).is_err()
+        );
+        assert!(handle_memory_slash_command(Some("help"), None)
+            .expect("help")
+            .contains("forget <id>"));
+
+        let forgot = handle_memory_slash_command(Some("forget"), Some(&id)).expect("forget");
+        assert!(forgot.starts_with(&format!("Forgot [{id}]")));
+        assert!(handle_memory_slash_command(Some("forget"), Some(&id)).is_err());
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        match previous_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        let _ = std::fs::remove_dir_all(workspace);
     }
 
     fn temp_workspace(label: &str) -> PathBuf {

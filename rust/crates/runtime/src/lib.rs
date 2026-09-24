@@ -14,6 +14,7 @@ mod mcp_client;
 pub mod mcp_lifecycle_hardened;
 mod mcp_stdio;
 pub mod mcp_tool_bridge;
+pub mod memory;
 mod oauth;
 pub mod permission_enforcer;
 mod permissions;
@@ -83,6 +84,11 @@ pub use mcp_stdio::{
     McpResource, McpResourceContents, McpServerManager, McpServerManagerError, McpStdioProcess,
     McpTool, McpToolCallContent, McpToolCallParams, McpToolCallResult, McpToolDiscoveryReport,
     UnsupportedMcpServer,
+};
+pub use memory::{
+    render_memory_section, MemoryEntry, MemoryError, MemoryKind, MemoryScope, MemoryStats,
+    MemoryStore, NewMemory, RememberOutcome, ScoredMemory, MAX_MEMORY_CHARS,
+    MAX_MEMORY_PROMPT_CHARS, MEMORY_DISABLE_ENV,
 };
 pub use oauth::{
     clear_oauth_credentials, code_challenge_s256, credentials_path, generate_pkce_pair,
