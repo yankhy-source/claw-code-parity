@@ -241,14 +241,25 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
         |_| SandboxConfig::default(),
         |runtime_config| runtime_config.sandbox().clone(),
     );
-    let request = config.resolve_request(
+    let (request, ignored) = config.resolve_request_for_call(
         input.dangerously_disable_sandbox.map(|disabled| !disabled),
         input.namespace_restrictions,
         input.isolate_network,
         input.filesystem_mode,
         input.allowed_mounts.clone(),
     );
-    resolve_sandbox_status_for_request(&request, cwd)
+    let mut status = resolve_sandbox_status_for_request(&request, cwd);
+    if !ignored.is_empty() {
+        let note = format!(
+            "ignored tool-call overrides that would loosen the configured sandbox: {}",
+            ignored.join(", ")
+        );
+        status.fallback_reason = Some(match status.fallback_reason.take() {
+            Some(existing) => format!("{existing}; {note}"),
+            None => note,
+        });
+    }
+    status
 }
 
 fn prepare_command(
@@ -336,21 +347,35 @@ mod tests {
     }
 
     #[test]
-    fn disables_sandbox_when_requested() {
+    fn model_supplied_overrides_cannot_loosen_the_configured_sandbox() {
+        // The default configuration enables the sandbox with namespace
+        // restrictions and workspace-only filesystem mode; a tool call must
+        // not be able to switch any of that off.
+        let _guard = crate::test_env_lock();
         let output = execute_bash(BashCommandInput {
             command: String::from("printf 'hello'"),
             timeout: Some(1_000),
             description: None,
             run_in_background: Some(false),
             dangerously_disable_sandbox: Some(true),
-            namespace_restrictions: None,
+            namespace_restrictions: Some(false),
             isolate_network: None,
-            filesystem_mode: None,
+            filesystem_mode: Some(FilesystemIsolationMode::Off),
             allowed_mounts: None,
         })
         .expect("bash command should execute");
 
-        assert!(!output.sandbox_status.expect("sandbox status").enabled);
+        let status = output.sandbox_status.expect("sandbox status");
+        assert!(status.enabled);
+        assert!(status.requested.namespace_restrictions);
+        assert_eq!(
+            status.filesystem_mode,
+            FilesystemIsolationMode::WorkspaceOnly
+        );
+        assert!(status
+            .fallback_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("dangerouslyDisableSandbox")));
     }
 
     #[cfg(unix)]

@@ -103,6 +103,88 @@ impl SandboxConfig {
             allowed_mounts: allowed_mounts_override.unwrap_or_else(|| self.allowed_mounts.clone()),
         }
     }
+
+    /// Resolve the request for one command from overrides supplied by the
+    /// model in the tool call. Unlike [`Self::resolve_request`], these may
+    /// only tighten the configured sandbox: attempts to loosen it are ignored
+    /// and the offending input fields are returned so the caller can report
+    /// them. Relaxing the sandbox is the operator's decision (settings), not
+    /// the model's.
+    #[must_use]
+    pub fn resolve_request_for_call(
+        &self,
+        enabled_override: Option<bool>,
+        namespace_override: Option<bool>,
+        network_override: Option<bool>,
+        filesystem_mode_override: Option<FilesystemIsolationMode>,
+        allowed_mounts_override: Option<Vec<String>>,
+    ) -> (SandboxRequest, Vec<&'static str>) {
+        let configured = self.resolve_request(None, None, None, None, None);
+        let mut ignored = Vec::new();
+        let mut tighten = |configured: bool, requested: Option<bool>, field: &'static str| {
+            if configured && requested == Some(false) {
+                ignored.push(field);
+            }
+            configured || requested == Some(true)
+        };
+        let enabled = tighten(
+            configured.enabled,
+            enabled_override,
+            "dangerouslyDisableSandbox",
+        );
+        let namespace_restrictions = tighten(
+            configured.namespace_restrictions,
+            namespace_override,
+            "namespaceRestrictions",
+        );
+        let network_isolation = tighten(
+            configured.network_isolation,
+            network_override,
+            "isolateNetwork",
+        );
+        let filesystem_mode = match filesystem_mode_override {
+            Some(mode) if mode.strictness() >= configured.filesystem_mode.strictness() => mode,
+            Some(_) => {
+                ignored.push("filesystemMode");
+                configured.filesystem_mode
+            }
+            None => configured.filesystem_mode,
+        };
+        let allowed_mounts = match allowed_mounts_override {
+            Some(mounts) => {
+                let (kept, extra): (Vec<_>, Vec<_>) = mounts
+                    .into_iter()
+                    .partition(|mount| configured.allowed_mounts.contains(mount));
+                if !extra.is_empty() {
+                    ignored.push("allowedMounts");
+                }
+                kept
+            }
+            None => configured.allowed_mounts,
+        };
+
+        (
+            SandboxRequest {
+                enabled,
+                namespace_restrictions,
+                network_isolation,
+                filesystem_mode,
+                allowed_mounts,
+            },
+            ignored,
+        )
+    }
+}
+
+impl FilesystemIsolationMode {
+    /// `Off` < `AllowList` (workspace plus listed mounts) < `WorkspaceOnly`.
+    fn strictness(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::AllowList => 1,
+            Self::WorkspaceOnly => 2,
+        }
+    }
 }
 
 #[must_use]
@@ -361,6 +443,58 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
+    }
+
+    #[test]
+    fn per_call_overrides_only_tighten_the_configured_sandbox() {
+        let strict = SandboxConfig {
+            enabled: Some(true),
+            namespace_restrictions: Some(true),
+            network_isolation: Some(true),
+            filesystem_mode: Some(FilesystemIsolationMode::AllowList),
+            allowed_mounts: vec!["logs".to_string(), "cache".to_string()],
+        };
+        let (request, ignored) = strict.resolve_request_for_call(
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(FilesystemIsolationMode::Off),
+            Some(vec!["logs".to_string(), "/".to_string()]),
+        );
+        assert!(request.enabled && request.namespace_restrictions && request.network_isolation);
+        assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
+        assert_eq!(request.allowed_mounts, vec!["logs"]);
+        assert_eq!(
+            ignored,
+            vec![
+                "dangerouslyDisableSandbox",
+                "namespaceRestrictions",
+                "isolateNetwork",
+                "filesystemMode",
+                "allowedMounts"
+            ]
+        );
+
+        let permissive = SandboxConfig {
+            enabled: Some(false),
+            namespace_restrictions: Some(false),
+            network_isolation: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::Off),
+            allowed_mounts: Vec::new(),
+        };
+        let (request, ignored) = permissive.resolve_request_for_call(
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(FilesystemIsolationMode::WorkspaceOnly),
+            None,
+        );
+        assert!(request.enabled && request.namespace_restrictions && request.network_isolation);
+        assert_eq!(
+            request.filesystem_mode,
+            FilesystemIsolationMode::WorkspaceOnly
+        );
+        assert!(ignored.is_empty());
     }
 
     #[test]
