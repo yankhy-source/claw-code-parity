@@ -64,7 +64,7 @@ impl ProjectContext {
         current_date: impl Into<String>,
     ) -> std::io::Result<Self> {
         let cwd = cwd.into();
-        let instruction_files = discover_instruction_files(&cwd)?;
+        let instruction_files = discover_instruction_files(&cwd);
         Ok(Self {
             cwd,
             current_date: current_date.into(),
@@ -193,7 +193,7 @@ pub fn prepend_bullets(items: Vec<String>) -> Vec<String> {
     items.into_iter().map(|item| format!(" - {item}")).collect()
 }
 
-fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
+fn discover_instruction_files(cwd: &Path) -> Vec<ContextFile> {
     let mut directories = Vec::new();
     let mut cursor = Some(cwd);
     while let Some(dir) = cursor {
@@ -210,21 +210,34 @@ fn discover_instruction_files(cwd: &Path) -> std::io::Result<Vec<ContextFile>> {
             dir.join(".claw").join("CLAUDE.md"),
             dir.join(".claw").join("instructions.md"),
         ] {
-            push_context_file(&mut files, candidate)?;
+            push_context_file(&mut files, candidate);
         }
     }
-    Ok(dedupe_instruction_files(files))
+    dedupe_instruction_files(files)
 }
 
-fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) -> std::io::Result<()> {
-    match fs::read_to_string(&path) {
-        Ok(content) if !content.trim().is_empty() => {
-            files.push(ContextFile { path, content });
-            Ok(())
+/// Discovery walks every ancestor up to `/`, so one unreadable file anywhere above the
+/// workspace (another user's `/tmp/CLAUDE.md`, a directory, a legacy encoding) must not stop
+/// startup: decode lossily and skip what cannot be read.
+fn push_context_file(files: &mut Vec<ContextFile>, path: PathBuf) {
+    match fs::read(&path) {
+        Ok(bytes) => {
+            let content = String::from_utf8_lossy(&bytes).into_owned();
+            if !content.trim().is_empty() {
+                files.push(ContextFile { path, content });
+            }
         }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) => {}
+        Err(error) => {
+            eprintln!(
+                "warning: skipping unreadable instruction file {}: {error}",
+                path.display()
+            );
+        }
     }
 }
 
@@ -658,6 +671,35 @@ mod tests {
             ]
         );
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn skips_unreadable_instruction_files_instead_of_failing_discovery() {
+        let root = temp_dir();
+        let apps = root.join("apps");
+        let nested = apps.join("api");
+        fs::create_dir_all(&nested).expect("nested dir");
+        // Saved as Latin-1, not UTF-8.
+        fs::write(root.join("CLAUDE.md"), b"Regeln f\xfcr das Projekt").expect("write latin-1");
+        // `.claw` is a regular file, so `.claw/CLAUDE.md` cannot exist.
+        fs::write(apps.join(".claw"), "not a directory").expect("write .claw file");
+        // A directory where an instruction file is expected.
+        fs::create_dir_all(apps.join("CLAUDE.local.md")).expect("directory named like a file");
+        fs::write(nested.join("CLAUDE.md"), "nested rules").expect("write nested rules");
+
+        let context = ProjectContext::discover(&nested, "2026-03-31")
+            .expect("unreadable instruction files should be skipped, not abort discovery");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+
+        let contents = context
+            .instruction_files
+            .iter()
+            .map(|file| file.content.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contents,
+            vec!["Regeln f\u{fffd}r das Projekt", "nested rules"]
+        );
     }
 
     #[test]
