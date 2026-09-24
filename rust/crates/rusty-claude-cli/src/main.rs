@@ -2931,11 +2931,8 @@ fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std
 }
 
 fn is_managed_session_file(path: &Path) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|extension| {
-            extension == PRIMARY_SESSION_EXTENSION || extension == LEGACY_SESSION_EXTENSION
-        })
+    // Also skips rotated copies of large session logs, which are not sessions of their own.
+    runtime::session_control::is_managed_session_file(path)
 }
 
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
@@ -5720,16 +5717,17 @@ mod tests {
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, normalize_permission_mode, parse_args,
-        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
-        permission_policy, print_help_to, push_output_block, render_config_report,
-        render_diff_report, render_diff_report_for, render_durable_memory_summary,
-        render_memory_report, render_repl_help, render_resume_usage, resolve_model_alias,
-        resolve_session_reference, response_to_events, resume_supported_slash_commands,
-        run_memory_action, run_resume_command, slash_command_completion_candidates_with_sessions,
-        status_context, validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat,
-        CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
-        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        format_unknown_slash_command_message, list_managed_sessions, normalize_permission_mode,
+        parse_args, parse_git_status_branch, parse_git_status_metadata_for,
+        parse_git_workspace_summary, permission_policy, print_help_to, push_output_block,
+        render_config_report, render_diff_report, render_diff_report_for,
+        render_durable_memory_summary, render_memory_report, render_repl_help, render_resume_usage,
+        resolve_model_alias, resolve_session_reference, response_to_events,
+        resume_supported_slash_commands, run_memory_action, run_resume_command,
+        slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
+        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
+        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
+        StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{
@@ -7018,6 +7016,39 @@ UU conflicted.rs",
 
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn rotated_session_logs_are_not_listed_as_managed_sessions() {
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let workspace = temp_workspace("rotated-session-logs");
+        std::fs::create_dir_all(&workspace).expect("workspace should create");
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("switch cwd");
+
+        let handle = create_managed_session_handle("session-large").expect("session handle");
+        let mut session = Session::new().with_persistence_path(handle.path.clone());
+        session
+            .push_user_text("x".repeat(300 * 1024))
+            .expect("large message should save");
+        session
+            .save_to_path(&handle.path)
+            .expect("session should save again and rotate");
+        let files_on_disk = std::fs::read_dir(workspace.join(".claw/sessions"))
+            .expect("sessions dir should read")
+            .count();
+        let sessions = list_managed_sessions().expect("sessions should list");
+
+        std::env::set_current_dir(previous).expect("restore cwd");
+        std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+        assert_eq!(
+            files_on_disk, 2,
+            "the save should have kept one rotated copy"
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session.session_id);
     }
 
     #[test]

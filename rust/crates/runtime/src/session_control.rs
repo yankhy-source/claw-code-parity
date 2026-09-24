@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::session::{Session, SessionError};
+use crate::session::{is_rotated_session_log, Session, SessionError};
 
 pub const PRIMARY_SESSION_EXTENSION: &str = "jsonl";
 pub const LEGACY_SESSION_EXTENSION: &str = "json";
@@ -168,6 +168,7 @@ pub fn is_managed_session_file(path: &Path) -> bool {
         .is_some_and(|extension| {
             extension == PRIMARY_SESSION_EXTENSION || extension == LEGACY_SESSION_EXTENSION
         })
+        && !is_rotated_session_log(path)
 }
 
 pub fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, SessionControlError> {
@@ -425,6 +426,38 @@ mod tests {
         assert_eq!(loaded.session.messages.len(), 1);
         assert_ne!(loaded.handle.id, older.session_id);
         assert!(is_session_reference_alias("last"));
+        fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[test]
+    fn rotated_session_logs_are_not_listed_as_sessions() {
+        // given a session that grew past the rotation threshold and was saved again
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir should exist");
+        let mut session = persist_session(&root, "large session");
+        session
+            .push_user_text("x".repeat(300 * 1024))
+            .expect("large message should save");
+        let path = session
+            .persistence_path()
+            .expect("managed session should have a path")
+            .to_path_buf();
+        session.save_to_path(&path).expect("session should save");
+        let files_on_disk = fs::read_dir(path.parent().expect("sessions dir"))
+            .expect("sessions dir should read")
+            .count();
+
+        // when
+        let sessions = list_managed_sessions_for(&root).expect("managed sessions should list");
+
+        // then
+        assert_eq!(
+            files_on_disk, 2,
+            "the save should have kept one rotated copy"
+        );
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, session.session_id);
+        assert_eq!(sessions[0].path, path);
         fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

@@ -1,6 +1,8 @@
+use std::collections::hash_map::RandomState;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,6 +14,7 @@ use crate::usage::TokenUsage;
 const SESSION_VERSION: u32 = 1;
 const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
 const MAX_ROTATED_FILES: usize = 3;
+const ROTATED_LOG_MARKER: &str = ".rot-";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +159,8 @@ impl Session {
         let snapshot = self.render_jsonl_snapshot()?;
         rotate_session_file_if_needed(path)?;
         write_atomic(path, &snapshot)?;
-        cleanup_rotated_logs(path)?;
+        // Pruning old rotations is housekeeping; it must not fail a save that already happened.
+        let _ = cleanup_rotated_logs(path);
         Ok(())
     }
 
@@ -862,9 +866,36 @@ fn current_time_millis() -> u64 {
 }
 
 fn generate_session_id() -> String {
-    let millis = current_time_millis();
-    let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("session-{millis}-{counter}")
+    session_id_for(
+        current_time_millis(),
+        SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+    )
+}
+
+/// Every process starts its counter at 0, so processes that create a session in the same
+/// millisecond would share an id (and a session file) without the random part.
+fn session_id_for(millis: u64, counter: u64) -> String {
+    format!("session-{millis}-{counter}-{:08x}", random_bits())
+}
+
+/// Suffix for temporary and rotated file names that stays unique across processes and within
+/// one millisecond.
+fn unique_file_suffix() -> String {
+    format!(
+        "{}-{}-{:08x}",
+        current_time_millis(),
+        SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed),
+        random_bits()
+    )
+}
+
+/// 32 random bits. Not cryptographic: `RandomState` is seeded from OS randomness per thread and
+/// re-keyed on every call, which is enough to tell processes (and calls) apart.
+fn random_bits() -> u64 {
+    let mut hasher = RandomState::new().build_hasher();
+    std::process::id().hash(&mut hasher);
+    SystemTime::now().hash(&mut hasher);
+    hasher.finish() >> 32
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
@@ -872,7 +903,10 @@ fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
         fs::create_dir_all(parent)?;
     }
     let temp_path = temporary_path_for(path);
-    fs::write(&temp_path, contents)?;
+    let mut file = fs::File::create(&temp_path)?;
+    file.write_all(contents.as_bytes())?;
+    // The rename must not become visible before the data it points to is durable.
+    file.sync_all()?;
     fs::rename(temp_path, path)?;
     Ok(())
 }
@@ -882,13 +916,12 @@ fn temporary_path_for(path: &Path) -> PathBuf {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("session");
-    path.with_file_name(format!(
-        "{file_name}.tmp-{}-{}",
-        current_time_millis(),
-        SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed)
-    ))
+    path.with_file_name(format!("{file_name}.tmp-{}", unique_file_suffix()))
 }
 
+/// Keeps a copy of an oversized log under a rotated name. The live file stays in place and is
+/// only replaced by the atomic rename in `write_atomic`, so a failed or interrupted save never
+/// leaves the session without a file.
 fn rotate_session_file_if_needed(path: &Path) -> Result<(), SessionError> {
     let Ok(metadata) = fs::metadata(path) else {
         return Ok(());
@@ -897,7 +930,9 @@ fn rotate_session_file_if_needed(path: &Path) -> Result<(), SessionError> {
         return Ok(());
     }
     let rotated_path = rotated_log_path(path);
-    fs::rename(path, rotated_path)?;
+    if fs::hard_link(path, &rotated_path).is_err() {
+        fs::copy(path, &rotated_path)?;
+    }
     Ok(())
 }
 
@@ -906,18 +941,31 @@ fn rotated_log_path(path: &Path) -> PathBuf {
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("session");
-    path.with_file_name(format!("{stem}.rot-{}.jsonl", current_time_millis()))
+    path.with_file_name(format!(
+        "{stem}{ROTATED_LOG_MARKER}{}.jsonl",
+        unique_file_suffix()
+    ))
+}
+
+/// Rotated copies keep the `.jsonl` extension (they are loadable for recovery) but are not
+/// sessions of their own.
+pub(crate) fn is_rotated_session_log(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name.contains(ROTATED_LOG_MARKER))
 }
 
 fn cleanup_rotated_logs(path: &Path) -> Result<(), SessionError> {
-    let Some(parent) = path.parent() else {
-        return Ok(());
-    };
+    // `Path::new("notes.jsonl").parent()` is `Some("")`, which `read_dir` rejects.
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or("session");
-    let prefix = format!("{stem}.rot-");
+    let prefix = format!("{stem}{ROTATED_LOG_MARKER}");
     let mut rotated_paths = fs::read_dir(parent)?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
@@ -1116,21 +1164,75 @@ mod tests {
 
         // then
         assert!(
-            !path.exists(),
-            "original path should be rotated away before rewrite"
+            path.exists(),
+            "the live session file must stay in place until the new snapshot replaces it"
+        );
+        let rotated = rotation_files(&path);
+        assert_eq!(rotated.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&rotated[0])
+                .expect("rotated copy should read")
+                .len(),
+            oversized_length
         );
 
         for _ in 0..5 {
             let rotated = super::rotated_log_path(&path);
             fs::write(&rotated, "old").expect("rotated file should write");
         }
+        assert_eq!(
+            rotation_files(&path).len(),
+            6,
+            "rotated log names must not collide"
+        );
         cleanup_rotated_logs(&path).expect("cleanup should succeed");
 
-        let rotated_count = rotation_files(&path).len();
-        assert!(rotated_count <= super::MAX_ROTATED_FILES);
+        assert_eq!(rotation_files(&path).len(), super::MAX_ROTATED_FILES);
         for rotated in rotation_files(&path) {
             fs::remove_file(rotated).expect("rotated file should be removable");
         }
+        fs::remove_file(&path).expect("live file should be removable");
+    }
+
+    #[test]
+    fn saves_to_a_bare_relative_filename_in_the_current_directory() {
+        let _guard = crate::test_env_lock();
+        let dir = temp_session_path("bare-relative").with_extension("");
+        fs::create_dir_all(&dir).expect("temp dir should create");
+        for index in 0..5 {
+            fs::write(dir.join(format!("notes.rot-{index}.jsonl")), "old")
+                .expect("rotated file should write");
+        }
+        let mut session = Session::new();
+        session
+            .push_user_text("hello")
+            .expect("message should append");
+
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&dir).expect("switch cwd");
+        let saved = session.save_to_path("notes.jsonl");
+        let restored = Session::load_from_path("notes.jsonl");
+        std::env::set_current_dir(previous).expect("restore cwd");
+        let remaining_rotations = rotation_files(&dir.join("notes.jsonl")).len();
+        fs::remove_dir_all(&dir).expect("temp dir should be removable");
+
+        saved.expect("saving to a bare relative filename should succeed");
+        assert_eq!(
+            restored.expect("session should reload").messages,
+            session.messages
+        );
+        assert_eq!(remaining_rotations, super::MAX_ROTATED_FILES);
+    }
+
+    #[test]
+    fn session_ids_differ_across_processes_started_in_the_same_millisecond() {
+        // Every process starts its counter at 0, so two `claw` processes that create a session
+        // in the same millisecond must still get different ids (and session files).
+        let first = super::session_id_for(1_790_000_000_000, 0);
+        let second = super::session_id_for(1_790_000_000_000, 0);
+
+        assert_ne!(first, second);
+        assert!(first.starts_with("session-1790000000000-0"));
     }
 
     #[test]
