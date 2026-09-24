@@ -40,6 +40,8 @@ pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDA
 pub const FRONTIER_MODEL_NAME: &str = "Claude Opus 4.6";
 const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
 const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
+const MAX_GIT_STATUS_CHARS: usize = 4_000;
+const MAX_GIT_DIFF_CHARS: usize = 4_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ContextFile {
@@ -240,19 +242,19 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(truncate_to_chars(trimmed, MAX_GIT_STATUS_CHARS))
     }
 }
 
 fn read_git_diff(cwd: &Path) -> Option<String> {
     let mut sections = Vec::new();
 
-    let staged = read_git_output(cwd, &["diff", "--cached"])?;
+    let staged = read_git_output(cwd, &["--no-optional-locks", "diff", "--cached"])?;
     if !staged.trim().is_empty() {
         sections.push(format!("Staged changes:\n{}", staged.trim_end()));
     }
 
-    let unstaged = read_git_output(cwd, &["diff"])?;
+    let unstaged = read_git_output(cwd, &["--no-optional-locks", "diff"])?;
     if !unstaged.trim().is_empty() {
         sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
     }
@@ -260,7 +262,12 @@ fn read_git_diff(cwd: &Path) -> Option<String> {
     if sections.is_empty() {
         None
     } else {
-        Some(sections.join("\n\n"))
+        // A regenerated lockfile or vendored tree can produce megabytes of diff, which would
+        // overflow the context on every request; the model can run git itself for the rest.
+        Some(truncate_to_chars(
+            &sections.join("\n\n"),
+            MAX_GIT_DIFF_CHARS,
+        ))
     }
 }
 
@@ -366,13 +373,18 @@ fn describe_instruction_file(file: &ContextFile, files: &[ContextFile]) -> Strin
 }
 
 fn truncate_instruction_content(content: &str, remaining_chars: usize) -> String {
-    let hard_limit = MAX_INSTRUCTION_FILE_CHARS.min(remaining_chars);
-    let trimmed = content.trim();
-    if trimmed.chars().count() <= hard_limit {
-        return trimmed.to_string();
+    truncate_to_chars(
+        content.trim(),
+        MAX_INSTRUCTION_FILE_CHARS.min(remaining_chars),
+    )
+}
+
+fn truncate_to_chars(content: &str, max_chars: usize) -> String {
+    if content.chars().count() <= max_chars {
+        return content.to_string();
     }
 
-    let mut output = trimmed.chars().take(hard_limit).collect::<String>();
+    let mut output = content.chars().take(max_chars).collect::<String>();
     output.push_str("\n\n[truncated]");
     output
 }
@@ -755,6 +767,52 @@ mod tests {
         assert!(diff.contains("tracked.txt"));
 
         fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn discover_with_git_bounds_large_status_and_diff_snapshots() {
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .expect("git should run");
+        };
+        git(&["init", "--quiet"]);
+        git(&["config", "user.email", "tests@example.com"]);
+        git(&["config", "user.name", "Runtime Prompt Tests"]);
+        fs::write(root.join("lockfile.txt"), "seed\n").expect("write tracked file");
+        git(&["add", "lockfile.txt"]);
+        git(&["commit", "-m", "init", "--quiet"]);
+        let regenerated = "dependency = \"1.0.0\"\n".repeat(20_000);
+        fs::write(root.join("lockfile.txt"), regenerated).expect("rewrite tracked file");
+        for index in 0..400 {
+            fs::write(
+                root.join(format!(
+                    "untracked-generated-file-with-long-name-{index:04}.txt"
+                )),
+                "x",
+            )
+            .expect("write untracked file");
+        }
+
+        let context =
+            ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+
+        let status = context.git_status.expect("git status should be present");
+        let diff = context.git_diff.expect("git diff should be present");
+        let marker_len = "\n\n[truncated]".len();
+        assert!(status.len() <= super::MAX_GIT_STATUS_CHARS + marker_len);
+        assert!(status.ends_with("[truncated]"));
+        assert!(status.contains("lockfile.txt"));
+        assert!(diff.len() <= super::MAX_GIT_DIFF_CHARS + marker_len);
+        assert!(diff.starts_with("Unstaged changes:"));
+        assert!(diff.ends_with("[truncated]"));
     }
 
     #[test]
