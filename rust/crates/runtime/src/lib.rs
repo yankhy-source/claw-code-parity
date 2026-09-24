@@ -26,6 +26,7 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+mod shell_split;
 mod sse;
 pub mod stale_branch;
 pub mod summary_compression;
