@@ -1,15 +1,23 @@
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Deeper input is rejected instead of recursing until the stack overflows.
+const MAX_NESTING_DEPTH: usize = 128;
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum JsonValue {
     Null,
     Bool(bool),
     Number(i64),
+    /// A number with a fraction or exponent, or an integer outside the `i64` range.
+    Float(f64),
     String(String),
     Array(Vec<JsonValue>),
     Object(BTreeMap<String, JsonValue>),
 }
+
+// The parser only produces finite floats, for which `==` is an equivalence relation.
+impl Eq for JsonValue {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JsonError {
@@ -40,6 +48,7 @@ impl JsonValue {
             Self::Null => "null".to_string(),
             Self::Bool(value) => value.to_string(),
             Self::Number(value) => value.to_string(),
+            Self::Float(value) => render_float(*value),
             Self::String(value) => render_string(value),
             Self::Array(values) => {
                 let rendered = values
@@ -112,6 +121,16 @@ impl JsonValue {
     }
 }
 
+fn render_float(value: f64) -> String {
+    if value.is_finite() {
+        // Debug keeps a fraction or exponent, so the value re-parses as a float.
+        format!("{value:?}")
+    } else {
+        // JSON has no NaN or infinity; the parser never produces them.
+        "null".to_string()
+    }
+}
+
 fn render_string(value: &str) -> String {
     let mut rendered = String::with_capacity(value.len() + 2);
     rendered.push('"');
@@ -146,6 +165,7 @@ fn push_unicode_escape(rendered: &mut String, control: char) {
 struct Parser<'a> {
     chars: Vec<char>,
     index: usize,
+    depth: usize,
     _source: &'a str,
 }
 
@@ -154,6 +174,7 @@ impl<'a> Parser<'a> {
         Self {
             chars: source.chars().collect(),
             index: 0,
+            depth: 0,
             _source: source,
         }
     }
@@ -167,7 +188,7 @@ impl<'a> Parser<'a> {
             Some('"') => self.parse_string().map(JsonValue::String),
             Some('[') => self.parse_array(),
             Some('{') => self.parse_object(),
-            Some('-' | '0'..='9') => self.parse_number().map(JsonValue::Number),
+            Some('-' | '0'..='9') => self.parse_number(),
             Some(other) => Err(JsonError::new(format!("unexpected character: {other}"))),
             None => Err(JsonError::new("unexpected end of input")),
         }
@@ -214,6 +235,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_unicode_escape(&mut self) -> Result<char, JsonError> {
+        let mut value = self.parse_hex_quad()?;
+        // Characters outside the BMP are escaped as a UTF-16 surrogate pair.
+        if (0xD800..=0xDBFF).contains(&value) {
+            if !(self.try_consume('\\') && self.try_consume('u')) {
+                return Err(JsonError::new("unpaired surrogate in unicode escape"));
+            }
+            let low = self.parse_hex_quad()?;
+            if !(0xDC00..=0xDFFF).contains(&low) {
+                return Err(JsonError::new("unpaired surrogate in unicode escape"));
+            }
+            value = 0x10000 + ((value - 0xD800) << 10) + (low - 0xDC00);
+        }
+        char::from_u32(value).ok_or_else(|| JsonError::new("invalid unicode scalar value"))
+    }
+
+    fn parse_hex_quad(&mut self) -> Result<u32, JsonError> {
         let mut value = 0_u32;
         for _ in 0..4 {
             let Some(ch) = self.next() else {
@@ -223,11 +260,12 @@ impl<'a> Parser<'a> {
                 | ch.to_digit(16)
                     .ok_or_else(|| JsonError::new("invalid unicode escape"))?;
         }
-        char::from_u32(value).ok_or_else(|| JsonError::new("invalid unicode scalar value"))
+        Ok(value)
     }
 
     fn parse_array(&mut self) -> Result<JsonValue, JsonError> {
         self.expect('[')?;
+        self.enter_nested()?;
         let mut values = Vec::new();
         loop {
             self.skip_whitespace();
@@ -241,11 +279,13 @@ impl<'a> Parser<'a> {
             }
             self.expect(',')?;
         }
+        self.depth -= 1;
         Ok(JsonValue::Array(values))
     }
 
     fn parse_object(&mut self) -> Result<JsonValue, JsonError> {
         self.expect('{')?;
+        self.enter_nested()?;
         let mut entries = BTreeMap::new();
         loop {
             self.skip_whitespace();
@@ -263,27 +303,70 @@ impl<'a> Parser<'a> {
             }
             self.expect(',')?;
         }
+        self.depth -= 1;
         Ok(JsonValue::Object(entries))
     }
 
-    fn parse_number(&mut self) -> Result<i64, JsonError> {
+    fn enter_nested(&mut self) -> Result<(), JsonError> {
+        self.depth += 1;
+        if self.depth > MAX_NESTING_DEPTH {
+            return Err(JsonError::new(format!(
+                "maximum nesting depth of {MAX_NESTING_DEPTH} exceeded"
+            )));
+        }
+        Ok(())
+    }
+
+    fn parse_number(&mut self) -> Result<JsonValue, JsonError> {
         let mut value = String::new();
         if self.try_consume('-') {
             value.push('-');
         }
+        if self.consume_digits(&mut value) == 0 {
+            return Err(JsonError::new("invalid number"));
+        }
 
+        let mut is_float = false;
+        if self.try_consume('.') {
+            value.push('.');
+            if self.consume_digits(&mut value) == 0 {
+                return Err(JsonError::new("invalid number: expected digit after '.'"));
+            }
+            is_float = true;
+        }
+        if let Some(exponent @ ('e' | 'E')) = self.peek() {
+            self.index += 1;
+            value.push(exponent);
+            if let Some(sign @ ('+' | '-')) = self.peek() {
+                self.index += 1;
+                value.push(sign);
+            }
+            if self.consume_digits(&mut value) == 0 {
+                return Err(JsonError::new("invalid number: expected digit in exponent"));
+            }
+            is_float = true;
+        }
+
+        if !is_float {
+            if let Ok(integer) = value.parse::<i64>() {
+                return Ok(JsonValue::Number(integer));
+            }
+        }
+        value
+            .parse::<f64>()
+            .ok()
+            .filter(|number| number.is_finite())
+            .map(JsonValue::Float)
+            .ok_or_else(|| JsonError::new("number out of range"))
+    }
+
+    fn consume_digits(&mut self, value: &mut String) -> usize {
+        let start = self.index;
         while let Some(ch @ '0'..='9') = self.peek() {
             value.push(ch);
             self.index += 1;
         }
-
-        if value.is_empty() || value == "-" {
-            return Err(JsonError::new("invalid number"));
-        }
-
-        value
-            .parse::<i64>()
-            .map_err(|_| JsonError::new("number out of range"))
+        self.index - start
     }
 
     fn expect(&mut self, expected: char) -> Result<(), JsonError> {
@@ -354,5 +437,63 @@ mod tests {
     #[test]
     fn escapes_control_characters() {
         assert_eq!(render_string("a\n\t\"b"), "\"a\\n\\t\\\"b\"");
+    }
+
+    #[test]
+    fn parses_decimal_and_exponent_numbers() {
+        let parsed = JsonValue::parse(
+            r#"{"timeout": 1.5, "scale": 1e3, "ratio": -2.5E-2, "big": 18446744073709551616, "retries": 3}"#,
+        )
+        .expect("valid JSON numbers should parse");
+        let object = parsed.as_object().expect("object");
+
+        assert_eq!(object["retries"].as_i64(), Some(3));
+        assert_eq!(object["timeout"].render(), "1.5");
+        assert_eq!(object["scale"].render(), "1000.0");
+        assert_eq!(object["ratio"].render(), "-0.025");
+        assert_eq!(object["big"].render(), "1.8446744073709552e19");
+        assert_eq!(object["timeout"].as_i64(), None);
+        assert_eq!(
+            JsonValue::parse(&parsed.render()).expect("rendered floats should re-parse"),
+            parsed
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_and_non_finite_numbers() {
+        for source in ["1.", "-", "1e", "1e+", ".5", "1e400", "-1.5e999"] {
+            assert!(
+                JsonValue::parse(source).is_err(),
+                "{source} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_surrogate_pair_escapes() {
+        let parsed = JsonValue::parse(r#""smile \ud83d\ude00 \u00e4""#).expect("should parse");
+        assert_eq!(parsed.as_str(), Some("smile \u{1F600} \u{e4}"));
+
+        for lone in [
+            r#""\ud83d""#,
+            r#""\ud83d x""#,
+            r#""\ude00""#,
+            r#""\ud83d\u0041""#,
+        ] {
+            assert!(JsonValue::parse(lone).is_err(), "{lone} should be rejected");
+        }
+    }
+
+    #[test]
+    fn limits_nesting_depth_instead_of_overflowing_the_stack() {
+        let shallow = format!("{}{}", "[".repeat(100), "]".repeat(100));
+        assert!(JsonValue::parse(&shallow).is_ok());
+
+        let deep_arrays = "[".repeat(100_000);
+        let deep_objects = r#"{"a":"#.repeat(100_000);
+        for deep in [deep_arrays, deep_objects] {
+            let error = JsonValue::parse(&deep).expect_err("deep nesting should be rejected");
+            assert!(error.to_string().contains("nesting"), "{error}");
+        }
     }
 }

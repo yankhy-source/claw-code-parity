@@ -1062,6 +1062,36 @@ mod tests {
     }
 
     #[test]
+    fn loads_settings_with_decimal_numbers_and_escaped_emoji() {
+        let root = temp_dir();
+        let cwd = root.join("project");
+        let home = root.join("home").join(".claw");
+        fs::create_dir_all(cwd.join(".claw")).expect("project config dir");
+        fs::create_dir_all(&home).expect("home config dir");
+        // As written by Python's json.dump(ensure_ascii=True).
+        let escaped_emoji = format!("{0}ud83d{0}ude00", '\\');
+        fs::write(
+            cwd.join(".claw").join("settings.json"),
+            format!(
+                r#"{{"model":"opus","someTool":{{"timeout":1.5,"scale":2e3}},"label":"{escaped_emoji}"}}"#
+            ),
+        )
+        .expect("write settings");
+
+        let loaded = ConfigLoader::new(&cwd, &home)
+            .load()
+            .expect("valid JSON settings should load");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+
+        assert_eq!(loaded.model(), Some("opus"));
+        assert_eq!(
+            loaded.get("label"),
+            Some(&JsonValue::String("\u{1F600}".to_string()))
+        );
+        assert!(loaded.as_json().render().contains(r#""timeout":1.5"#));
+    }
+
+    #[test]
     fn rejects_non_object_settings_files() {
         let root = temp_dir();
         let cwd = root.join("project");
