@@ -1,6 +1,9 @@
 //! Permission enforcement layer that gates tool execution based on the
 //! active `PermissionPolicy`.
 
+use std::path::Path;
+
+use crate::file_ops::is_path_within_workspace;
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
 use serde::{Deserialize, Serialize};
 
@@ -136,21 +139,15 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Workspace boundary check. Relative paths are resolved against the
+/// workspace root; `..`, symlinks and missing directories are resolved the
+/// same way a write would resolve them (see `file_ops::resolve_write_target`).
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
-        path.to_owned()
-    } else {
-        format!("{workspace_root}/{path}")
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
     };
-
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
-    } else {
-        format!("{workspace_root}/")
-    };
-
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+    let root = cwd.join(workspace_root);
+    is_path_within_workspace(Path::new(path), &root, &root)
 }
 
 /// Conservative heuristic: is this bash command read-only?
@@ -326,6 +323,56 @@ mod tests {
         assert!(is_within_workspace("/workspace", "/workspace"));
         assert!(!is_within_workspace("/etc/passwd", "/workspace"));
         assert!(!is_within_workspace("/workspacex/hack", "/workspace"));
+    }
+
+    #[test]
+    fn workspace_boundary_rejects_parent_dir_traversal() {
+        assert!(!is_within_workspace(
+            "/workspace/../etc/passwd",
+            "/workspace"
+        ));
+        assert!(!is_within_workspace("src/../../etc/passwd", "/workspace"));
+
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        assert!(matches!(
+            enforcer.check_file_write("/workspace/../etc/passwd", "/workspace"),
+            EnforcementResult::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_boundary_resolves_relative_roots_against_the_current_dir() {
+        let _guard = crate::test_env_lock();
+        assert!(is_within_workspace("src/main.rs", "relative-ws"));
+        assert!(!is_within_workspace("/etc/passwd", "relative-ws"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_boundary_follows_symlinked_directories() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("enforcer-symlink-{unique}"));
+        let workspace = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).expect("symlink");
+
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let escaped = workspace.join("link").join("new.txt");
+
+        assert!(!is_within_workspace(
+            escaped.to_string_lossy().as_ref(),
+            &workspace_str
+        ));
+        assert!(is_within_workspace(
+            workspace.join("inside.txt").to_string_lossy().as_ref(),
+            &workspace_str
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
