@@ -3,7 +3,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::config::RuntimePermissionRuleConfig;
+use crate::config::{
+    parse_permission_mode_label, ResolvedPermissionMode, RuntimePermissionRuleConfig,
+};
 use crate::file_ops::resolve_write_target;
 use crate::shell_split::{command_segments, normalize_command_text, split_simple_commands};
 
@@ -43,6 +45,11 @@ impl PermissionMode {
         }
     }
 
+    /// Rank of this mode used as a requirement.
+    fn requirement_rank(self) -> u8 {
+        self.capability_rank().unwrap_or(2)
+    }
+
     /// Whether running in this mode grants `required` without asking.
     /// `Allow` grants everything; `Prompt` grants nothing and always asks.
     #[must_use]
@@ -50,12 +57,9 @@ impl PermissionMode {
         match self {
             Self::Allow => true,
             Self::Prompt => false,
-            current => {
-                let required_rank = required.capability_rank().unwrap_or(2);
-                current
-                    .capability_rank()
-                    .is_some_and(|rank| rank >= required_rank)
-            }
+            current => current
+                .capability_rank()
+                .is_some_and(|rank| rank >= required.requirement_rank()),
         }
     }
 }
@@ -128,6 +132,36 @@ pub struct PermissionPolicy {
     allow_rules: Vec<PermissionRule>,
     deny_rules: Vec<PermissionRule>,
     ask_rules: Vec<PermissionRule>,
+    workspace_root: Option<PathBuf>,
+}
+
+/// What one specific call requires, which can be stricter than the tool's
+/// registered requirement.
+#[derive(Debug)]
+struct CallRequirement {
+    mode: PermissionMode,
+    escalation: Option<Escalation>,
+}
+
+#[derive(Debug)]
+enum Escalation {
+    /// A file tool write that leaves the workspace or touches permission
+    /// settings. Allow rules only cover it when they name the resolved
+    /// target (`None` when it cannot be resolved, leaving unscoped rules).
+    FileWrite {
+        reason: String,
+        target: Option<String>,
+    },
+    /// A Config call that would grant a stronger permission mode.
+    PermissionGrant { reason: String },
+}
+
+impl Escalation {
+    fn reason(&self) -> &str {
+        match self {
+            Self::FileWrite { reason, .. } | Self::PermissionGrant { reason } => reason,
+        }
+    }
 }
 
 impl PermissionPolicy {
@@ -139,7 +173,24 @@ impl PermissionPolicy {
             allow_rules: Vec::new(),
             deny_rules: Vec::new(),
             ask_rules: Vec::new(),
+            workspace_root: None,
         }
+    }
+
+    /// Confine the file-writing tools (`write_file`, `edit_file`,
+    /// `NotebookEdit`) to `workspace_root`: a call whose target resolves
+    /// outside it, or onto a permission-bearing settings file inside it,
+    /// requires `danger-full-access`, so workspace-write prompts and
+    /// read-only denies.
+    #[must_use]
+    pub fn with_workspace_root(mut self, workspace_root: impl Into<PathBuf>) -> Self {
+        self.workspace_root = Some(workspace_root.into());
+        self
+    }
+
+    #[must_use]
+    pub fn workspace_root(&self) -> Option<&Path> {
+        self.workspace_root.as_deref()
     }
 
     #[must_use]
@@ -186,6 +237,51 @@ impl PermissionPolicy {
             .unwrap_or(PermissionMode::DangerFullAccess)
     }
 
+    /// The mode this particular call requires: the tool's registered
+    /// requirement, raised for file writes that leave the workspace or touch
+    /// permission settings, and for Config calls that would grant a stronger
+    /// permission mode than the tool itself needs.
+    #[must_use]
+    pub fn required_mode_for_input(&self, tool_name: &str, input: &str) -> PermissionMode {
+        self.call_requirement(tool_name, input).mode
+    }
+
+    fn call_requirement(&self, tool_name: &str, input: &str) -> CallRequirement {
+        let mut requirement = CallRequirement {
+            mode: self.required_mode_for(tool_name),
+            escalation: None,
+        };
+        let Ok(Value::Object(object)) = serde_json::from_str::<Value>(input) else {
+            return requirement;
+        };
+
+        if let (Some(root), Some(key)) = (
+            self.workspace_root.as_deref(),
+            workspace_write_path_key(tool_name),
+        ) {
+            if let Some(path) = object.get(key).and_then(Value::as_str) {
+                if let Some((reason, target)) = workspace_write_escape(path, root) {
+                    requirement.mode = PermissionMode::DangerFullAccess;
+                    requirement.escalation = Some(Escalation::FileWrite {
+                        reason: format!("tool '{tool_name}' {reason}"),
+                        target,
+                    });
+                }
+            }
+        }
+
+        if canonical_tool_name(tool_name) == "config" {
+            if let Some((granted, reason)) = config_permission_grant(&object) {
+                if granted.requirement_rank() > requirement.mode.requirement_rank() {
+                    requirement.mode = granted;
+                    requirement.escalation = Some(Escalation::PermissionGrant { reason });
+                }
+            }
+        }
+
+        requirement
+    }
+
     #[must_use]
     pub fn authorize(
         &self,
@@ -221,19 +317,41 @@ impl PermissionPolicy {
         }
 
         let current_mode = self.active_mode();
-        let required_mode = self.required_mode_for(tool_name);
+        let requirement = self.call_requirement(tool_name, input);
+        let required_mode = requirement.mode;
         let ask_rule = Self::find_matching_rule(
             &self.ask_rules,
             tool_name,
             subject.as_ref(),
             RuleEffect::Restrict,
         );
+        // An escalated file write is only covered by an allow rule that names
+        // where the write really lands, not by one that matched a path which
+        // then escapes through a symlink.
+        let escaped_target = match &requirement.escalation {
+            Some(Escalation::FileWrite { target, .. }) => Some(
+                target
+                    .as_deref()
+                    .map(PermissionSubject::for_resolved_target),
+            ),
+            _ => None,
+        };
+        let grant_subject = match &escaped_target {
+            Some(target) => target.as_ref(),
+            None => subject.as_ref(),
+        };
         let allow_rule = Self::find_matching_rule(
             &self.allow_rules,
             tool_name,
-            subject.as_ref(),
+            grant_subject,
             RuleEffect::Grant,
         );
+        let escalation_detail = requirement
+            .escalation
+            .as_ref()
+            .map_or_else(String::new, |escalation| {
+                format!(" ({})", escalation.reason())
+            });
 
         match context.override_decision() {
             Some(PermissionOverride::Deny) => {
@@ -304,7 +422,7 @@ impl PermissionPolicy {
                 && required_mode == PermissionMode::DangerFullAccess)
         {
             let reason = Some(format!(
-                "tool '{tool_name}' requires approval to escalate from {} to {}",
+                "tool '{tool_name}' requires approval to escalate from {} to {}{escalation_detail}",
                 current_mode.as_str(),
                 required_mode.as_str()
             ));
@@ -320,7 +438,7 @@ impl PermissionPolicy {
 
         PermissionOutcome::Deny {
             reason: format!(
-                "tool '{tool_name}' requires {} permission; current mode is {}",
+                "tool '{tool_name}' requires {} permission{escalation_detail}; current mode is {}",
                 required_mode.as_str(),
                 current_mode.as_str()
             ),
@@ -697,9 +815,126 @@ impl PermissionSubject {
         }
     }
 
+    /// A path subject that is already the fully resolved write target.
+    fn for_resolved_target(target: &str) -> Self {
+        Self {
+            kind: SubjectKind::Path,
+            value: target.to_string(),
+            normalized_path: None,
+            resolved_path: Some(target.to_string()),
+        }
+    }
+
     fn path_candidates(&self) -> impl Iterator<Item = &str> {
         std::iter::once(self.value.as_str()).chain(self.normalized_path.as_deref())
     }
+}
+
+/// File tools that a workspace root confines, and the input field naming the
+/// file each one writes.
+fn workspace_write_path_key(tool_name: &str) -> Option<&'static str> {
+    match canonical_tool_name(tool_name).as_str() {
+        "write_file" | "edit_file" => Some("path"),
+        "notebookedit" => Some("notebook_path"),
+        _ => None,
+    }
+}
+
+/// Why a write to `path` needs more than workspace-write, plus the resolved
+/// target when it is known; `None` when the write stays inside `root` and
+/// does not touch permission settings. Relative paths resolve against the
+/// current directory, exactly like the file tools resolve them. Anything
+/// that cannot be resolved counts as an escape (fail closed).
+fn workspace_write_escape(path: &str, root: &Path) -> Option<(String, Option<String>)> {
+    let Ok(cwd) = std::env::current_dir() else {
+        return Some((
+            format!("writes to '{path}', which cannot be resolved without a current directory"),
+            None,
+        ));
+    };
+    let Ok(root) = resolve_write_target(root, &cwd) else {
+        return Some((
+            format!(
+                "writes to '{path}', but the workspace root '{}' cannot be resolved",
+                root.display()
+            ),
+            None,
+        ));
+    };
+    let target = match resolve_write_target(Path::new(path), &cwd) {
+        Ok(target) => target,
+        Err(error) => {
+            return Some((
+                format!("writes to '{path}', which cannot be confined to the workspace: {error}"),
+                None,
+            ));
+        }
+    };
+    let display = target.to_string_lossy().into_owned();
+    match target.strip_prefix(&root) {
+        Err(_) => Some((
+            format!(
+                "writes to '{display}', outside the workspace root '{}'",
+                root.display()
+            ),
+            Some(display),
+        )),
+        Ok(relative) if is_permission_settings_path(relative) => Some((
+            format!("writes to '{display}', which holds permission settings"),
+            Some(display),
+        )),
+        Ok(_) => None,
+    }
+}
+
+/// Workspace files whose contents decide permissions: the settings files
+/// (`permissions`, hooks, MCP servers, sandbox) and the `EnterPlanMode` state
+/// that `ExitPlanMode` restores into them. Compared case-insensitively for
+/// case-insensitive filesystems.
+fn is_permission_settings_path(relative: &Path) -> bool {
+    let parts = relative
+        .components()
+        .map(|component| component.as_os_str().to_string_lossy().to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    match parts.as_slice() {
+        [name] => name == ".claw.json",
+        [dir, rest @ ..] if dir == ".claw" => matches!(
+            rest.first().map(String::as_str),
+            Some("settings.json" | "settings.local.json" | "tool-state")
+        ),
+        _ => false,
+    }
+}
+
+/// Setting `permissions.defaultMode` through the Config tool grants that mode
+/// on the next launch, so the call needs the permission it would grant.
+/// Values that are not recognized fail closed to `danger-full-access`.
+fn config_permission_grant(
+    object: &serde_json::Map<String, Value>,
+) -> Option<(PermissionMode, String)> {
+    let setting = object.get("setting")?.as_str()?.trim();
+    if !setting.to_ascii_lowercase().starts_with("permissions") {
+        return None;
+    }
+    let value = object.get("value").filter(|value| !value.is_null())?;
+    let granted = value
+        .as_str()
+        .and_then(|label| parse_permission_mode_label(label.trim(), "Config").ok())
+        .map_or(
+            PermissionMode::DangerFullAccess,
+            |resolved| match resolved {
+                ResolvedPermissionMode::ReadOnly => PermissionMode::ReadOnly,
+                ResolvedPermissionMode::WorkspaceWrite => PermissionMode::WorkspaceWrite,
+                ResolvedPermissionMode::DangerFullAccess => PermissionMode::DangerFullAccess,
+            },
+        );
+    Some((
+        granted,
+        format!(
+            "setting '{setting}' to {value} grants {} on the next launch",
+            granted.as_str()
+        ),
+    ))
 }
 
 #[cfg(test)]
@@ -848,6 +1083,202 @@ mod tests {
 
     fn bash_input(command: &str) -> String {
         serde_json::json!({ "command": command }).to_string()
+    }
+
+    fn temp_workspace(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("permissions-{name}-{unique}"));
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        (root, workspace)
+    }
+
+    fn workspace_policy(mode: PermissionMode, workspace: &std::path::Path) -> PermissionPolicy {
+        PermissionPolicy::new(mode)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("edit_file", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("NotebookEdit", PermissionMode::WorkspaceWrite)
+            .with_tool_requirement("Config", PermissionMode::WorkspaceWrite)
+            .with_workspace_root(workspace)
+    }
+
+    fn write_input(path: &std::path::Path) -> String {
+        serde_json::json!({ "path": path, "content": "x" }).to_string()
+    }
+
+    #[test]
+    fn workspace_write_prompts_before_file_tools_leave_the_workspace() {
+        let (root, workspace) = temp_workspace("escape");
+        let outside = root.join("outside.txt");
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite, &workspace);
+
+        assert!(matches!(
+            policy.authorize("write_file", &write_input(&outside), None),
+            PermissionOutcome::Deny { reason } if reason.contains("outside the workspace root")
+        ));
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: true,
+        };
+        assert_eq!(
+            policy.authorize("write_file", &write_input(&outside), Some(&mut prompter)),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(
+            prompter.seen[0].required_mode,
+            PermissionMode::DangerFullAccess
+        );
+
+        let edit = serde_json::json!({"path": outside, "old_string": "a", "new_string": "b"});
+        let notebook = serde_json::json!({"notebook_path": root.join("outside.ipynb")});
+        let dot_dot = workspace
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("outside.txt");
+        for (tool, input) in [
+            ("edit_file", edit.to_string()),
+            ("NotebookEdit", notebook.to_string()),
+            ("write_file", write_input(&dot_dot)),
+        ] {
+            assert!(
+                matches!(
+                    policy.authorize(tool, &input, None),
+                    PermissionOutcome::Deny { .. }
+                ),
+                "{tool} {input} must not be auto-allowed outside the workspace"
+            );
+        }
+
+        assert_eq!(
+            policy.authorize(
+                "write_file",
+                &write_input(&workspace.join("src").join("new.rs")),
+                None
+            ),
+            PermissionOutcome::Allow
+        );
+        assert_eq!(
+            workspace_policy(PermissionMode::DangerFullAccess, &workspace).authorize(
+                "write_file",
+                &write_input(&outside),
+                None
+            ),
+            PermissionOutcome::Allow
+        );
+        assert!(matches!(
+            workspace_policy(PermissionMode::ReadOnly, &workspace).authorize(
+                "write_file",
+                &write_input(&outside),
+                None
+            ),
+            PermissionOutcome::Deny { reason } if reason.contains("requires danger-full-access")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_write_follows_symlinks_and_scopes_allow_rules_to_the_real_target() {
+        let (root, workspace) = temp_workspace("symlink");
+        let outside_dir = root.join("outside");
+        std::fs::create_dir_all(&outside_dir).expect("outside dir");
+        std::os::unix::fs::symlink(&outside_dir, workspace.join("link")).expect("symlink");
+        let escaped = workspace.join("link").join("new.txt");
+        let rules = RuntimePermissionRuleConfig::new(
+            vec![format!("write_file({}/:*)", workspace.display())],
+            Vec::new(),
+            Vec::new(),
+        );
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite, &workspace)
+            .with_permission_rules(&rules);
+
+        assert!(matches!(
+            policy.authorize("write_file", &write_input(&escaped), None),
+            PermissionOutcome::Deny { reason } if reason.contains("outside the workspace root")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_write_prompts_before_editing_permission_settings() {
+        let (root, workspace) = temp_workspace("settings");
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite, &workspace);
+
+        for relative in [
+            ".claw/settings.local.json",
+            ".claw/settings.json",
+            ".claw.json",
+            ".claw/tool-state/plan-mode.json",
+            ".CLAW/Settings.Local.json",
+        ] {
+            assert!(
+                matches!(
+                    policy.authorize("write_file", &write_input(&workspace.join(relative)), None),
+                    PermissionOutcome::Deny { reason } if reason.contains("permission settings")
+                ),
+                "{relative} must require approval"
+            );
+        }
+        assert_eq!(
+            policy.authorize(
+                "write_file",
+                &write_input(&workspace.join(".claw").join("instructions.md")),
+                None
+            ),
+            PermissionOutcome::Allow
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn config_tool_needs_the_permission_mode_it_would_grant() {
+        let (root, workspace) = temp_workspace("config");
+        let policy = workspace_policy(PermissionMode::WorkspaceWrite, &workspace);
+        let config = |value: serde_json::Value| {
+            serde_json::json!({"setting": "permissions.defaultMode", "value": value}).to_string()
+        };
+
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: false,
+        };
+        assert!(matches!(
+            policy.authorize("Config", &config("dontAsk".into()), Some(&mut prompter)),
+            PermissionOutcome::Deny { reason } if reason == "not now"
+        ));
+        assert_eq!(
+            prompter.seen[0].required_mode,
+            PermissionMode::DangerFullAccess
+        );
+        for escalating in [
+            config("dontAsk".into()),
+            config("danger-full-access".into()),
+            config("bogus".into()),
+            config(true.into()),
+        ] {
+            assert!(matches!(
+                policy.authorize("Config", &escalating, None),
+                PermissionOutcome::Deny { .. }
+            ));
+        }
+
+        for allowed in [
+            config("plan".into()),
+            config("acceptEdits".into()),
+            serde_json::json!({"setting": "permissions.defaultMode"}).to_string(),
+            serde_json::json!({"setting": "theme", "value": "dark"}).to_string(),
+        ] {
+            assert_eq!(
+                policy.authorize("Config", &allowed, None),
+                PermissionOutcome::Allow
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

@@ -705,7 +705,7 @@ fn parse_optional_permission_mode(
     parse_permission_mode_label(mode, "merged settings.permissions.defaultMode").map(Some)
 }
 
-fn parse_permission_mode_label(
+pub(crate) fn parse_permission_mode_label(
     mode: &str,
     context: &str,
 ) -> Result<ResolvedPermissionMode, ConfigError> {

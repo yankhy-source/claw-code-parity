@@ -43,7 +43,7 @@ impl PermissionEnforcer {
             PermissionOutcome::Allow => EnforcementResult::Allowed,
             PermissionOutcome::Deny { reason } => {
                 let active_mode = self.policy.active_mode();
-                let required_mode = self.policy.required_mode_for(tool_name);
+                let required_mode = self.policy.required_mode_for_input(tool_name, input);
                 EnforcementResult::Denied {
                     tool: tool_name.to_owned(),
                     active_mode: active_mode.as_str().to_owned(),

@@ -5535,8 +5535,13 @@ fn permission_policy(
     feature_config: &runtime::RuntimeFeatureConfig,
     tool_registry: &GlobalToolRegistry,
 ) -> Result<PermissionPolicy, String> {
+    // The session's working directory is the workspace that workspace-write
+    // mode confines write_file/edit_file/NotebookEdit to.
+    let workspace_root = env::current_dir().map_err(|error| error.to_string())?;
     Ok(tool_registry.permission_specs(None)?.into_iter().fold(
-        PermissionPolicy::new(mode).with_permission_rules(feature_config.permission_rules()),
+        PermissionPolicy::new(mode)
+            .with_permission_rules(feature_config.permission_rules())
+            .with_workspace_root(workspace_root),
         |policy, (name, required_permission)| {
             policy.with_tool_requirement(name, required_permission)
         },
@@ -6371,6 +6376,38 @@ mod tests {
         .expect("permission policy should build");
         let required = policy.required_mode_for("plugin_echo");
         assert_eq!(required, PermissionMode::WorkspaceWrite);
+    }
+
+    #[test]
+    fn permission_policy_confines_workspace_write_file_tools_to_the_workspace() {
+        let _guard = env_lock();
+        let feature_config = runtime::RuntimeFeatureConfig::default();
+        let policy = permission_policy(
+            PermissionMode::WorkspaceWrite,
+            &feature_config,
+            &GlobalToolRegistry::builtin(),
+        )
+        .expect("permission policy should build");
+        let outside =
+            std::env::temp_dir().join(format!("claw-outside-workspace-{}.txt", std::process::id()));
+
+        let outcome = policy.authorize(
+            "write_file",
+            &json!({"path": outside, "content": "x"}).to_string(),
+            None,
+        );
+        assert!(matches!(
+            outcome,
+            runtime::PermissionOutcome::Deny { ref reason } if reason.contains("outside the workspace root")
+        ));
+        assert_eq!(
+            policy.authorize(
+                "write_file",
+                &json!({"path": "target/claw-policy-probe.txt", "content": "x"}).to_string(),
+                None,
+            ),
+            runtime::PermissionOutcome::Allow
+        );
     }
 
     #[test]

@@ -140,7 +140,8 @@ Canonical scenario map: `rust/mock_parity_scenarios.json`
 
 - Harness scenarios validate `write_file_denied`, `bash_permission_prompt_approved`, and `bash_permission_prompt_denied`.
 - `PermissionEnforcer::check()` delegates to `PermissionPolicy::authorize()` and returns structured allow/deny results.
-- `check_file_write()` enforces workspace boundaries and read-only denial; `check_bash()` denies mutating commands in read-only mode and blocks prompt-mode bash without confirmation.
+- Workspace boundaries are enforced in `PermissionPolicy` itself: the CLI sets `with_workspace_root(cwd)`, and a `write_file`/`edit_file`/`NotebookEdit` call whose target resolves outside the workspace (or onto `.claw` permission settings), or a `Config` call that would grant a stronger `permissions.defaultMode`, requires `danger-full-access` — workspace-write prompts, read-only denies.
+- `check_file_write()` and `check_bash()` are library helpers (not wired into the CLI): `check_file_write()` applies the same boundary resolution; `check_bash()` denies mutating commands in read-only mode and blocks prompt-mode bash without confirmation.
 
 ## Tool Surface: 40 exposed tool specs on `main`
 
