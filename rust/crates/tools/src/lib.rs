@@ -11,7 +11,7 @@ use api::{
 use plugins::PluginTool;
 use reqwest::blocking::Client;
 use runtime::{
-    edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
+    current_date, edit_file, execute_bash, glob_search, grep_search, load_system_prompt,
     lsp_client::LspRegistry,
     mcp_tool_bridge::McpToolRegistry,
     permission_enforcer::{EnforcementResult, PermissionEnforcer},
@@ -3051,7 +3051,6 @@ fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
-const DEFAULT_AGENT_SYSTEM_DATE: &str = "2026-03-31";
 const DEFAULT_AGENT_MAX_ITERATIONS: usize = 32;
 
 fn execute_agent(input: AgentInput) -> Result<AgentOutput, String> {
@@ -3203,13 +3202,8 @@ fn build_agent_runtime(
 
 fn build_agent_system_prompt(subagent_type: &str) -> Result<Vec<String>, String> {
     let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
-    let mut prompt = load_system_prompt(
-        cwd,
-        DEFAULT_AGENT_SYSTEM_DATE.to_string(),
-        std::env::consts::OS,
-        "unknown",
-    )
-    .map_err(|error| error.to_string())?;
+    let mut prompt = load_system_prompt(cwd, current_date(), std::env::consts::OS, "unknown")
+        .map_err(|error| error.to_string())?;
     prompt.push(format!(
         "You are a background sub-agent of type `{subagent_type}`. Work only on the delegated task, use only the tools available to you, do not ask the user questions, and finish with a concise result."
     ));
@@ -5038,10 +5032,11 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        agent_permission_policy, allowed_tools_for_subagent, classify_lane_failure,
-        execute_agent_with_spawn, execute_tool, final_assistant_text, mvp_tool_specs,
-        permission_mode_from_plugin, persist_agent_terminal_state, push_output_block, AgentInput,
-        AgentJob, GlobalToolRegistry, LaneFailureClass, SubagentToolExecutor,
+        agent_permission_policy, allowed_tools_for_subagent, build_agent_system_prompt,
+        classify_lane_failure, execute_agent_with_spawn, execute_tool, final_assistant_text,
+        mvp_tool_specs, permission_mode_from_plugin, persist_agent_terminal_state,
+        push_output_block, AgentInput, AgentJob, GlobalToolRegistry, LaneFailureClass,
+        SubagentToolExecutor,
     };
     use api::OutputContentBlock;
     use runtime::{
@@ -5069,6 +5064,25 @@ mod tests {
             .fold(PermissionPolicy::new(mode), |policy, spec| {
                 policy.with_tool_requirement(spec.name, spec.required_permission)
             })
+    }
+
+    #[test]
+    fn agent_system_prompt_uses_todays_date() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = runtime::current_date();
+        let prompt = build_agent_system_prompt("Explore")
+            .expect("agent system prompt should build")
+            .join("\n\n");
+        let after = runtime::current_date();
+
+        assert!(
+            [&before, &after]
+                .iter()
+                .any(|today| prompt.contains(&format!("Today's date is {today}."))),
+            "sub-agent prompt should carry today's date ({before})"
+        );
     }
 
     #[test]

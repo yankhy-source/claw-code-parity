@@ -39,14 +39,15 @@ use init::initialize_repo;
 use plugins::{PluginHooks, PluginManager, PluginManagerConfig, PluginRegistry};
 use render::{MarkdownStreamState, Spinner, TerminalRenderer};
 use runtime::{
-    clear_oauth_credentials, format_usd, generate_pkce_pair, generate_state, load_system_prompt,
-    parse_oauth_callback_request_target, pricing_for_model, resolve_sandbox_status,
-    save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent, CompactionConfig, ConfigLoader,
-    ConfigSource, ContentBlock, ConversationMessage, ConversationRuntime, McpServerManager,
-    McpTool, MemoryEntry, MemoryScope, MemoryStore, MessageRole, ModelPricing, NewMemory,
-    OAuthAuthorizationRequest, OAuthConfig, OAuthTokenExchangeRequest, PermissionMode,
-    PermissionPolicy, ProjectContext, PromptCacheEvent, RememberOutcome, ResolvedPermissionMode,
-    RuntimeError, Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
+    clear_oauth_credentials, current_date, format_usd, generate_pkce_pair, generate_state,
+    load_system_prompt, parse_oauth_callback_request_target, pricing_for_model,
+    resolve_sandbox_status, save_oauth_credentials, ApiClient, ApiRequest, AssistantEvent,
+    CompactionConfig, ConfigLoader, ConfigSource, ContentBlock, ConversationMessage,
+    ConversationRuntime, McpServerManager, McpTool, MemoryEntry, MemoryScope, MemoryStore,
+    MessageRole, ModelPricing, NewMemory, OAuthAuthorizationRequest, OAuthConfig,
+    OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, PromptCacheEvent,
+    RememberOutcome, ResolvedPermissionMode, RuntimeError, Session, TokenUsage, ToolError,
+    ToolExecutor, UsageTracker,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -60,7 +61,8 @@ fn max_tokens_for_model(model: &str) -> u32 {
         64_000
     }
 }
-const DEFAULT_DATE: &str = "2026-03-31";
+/// Shown as the build date by `claw --version`; prompts use `current_date()` instead.
+const BUILD_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
@@ -664,7 +666,7 @@ fn filter_tool_specs(
 
 fn parse_system_prompt_args(args: &[String]) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let mut date = DEFAULT_DATE.to_string();
+    let mut date = current_date();
     let mut index = 0;
 
     while index < args.len() {
@@ -3143,7 +3145,7 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover_with_git(&cwd, current_date())?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
@@ -3390,7 +3392,7 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let project_context = ProjectContext::discover(&cwd, current_date())?;
     let mut lines = vec![format!(
         "Memory
   Working directory {}
@@ -3887,7 +3889,7 @@ fn render_version_report() -> String {
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {BUILD_DATE}"
     )
 }
 
@@ -3981,7 +3983,7 @@ fn resolve_export_path(
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
-        DEFAULT_DATE,
+        current_date(),
         env::consts::OS,
         "unknown",
     )?)
@@ -5710,13 +5712,13 @@ fn print_help() {
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
-        format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
-        format_compact_report, format_cost_report, format_internal_prompt_progress_line,
-        format_issue_report, format_model_report, format_model_switch_report,
-        format_permissions_report, format_permissions_switch_report, format_pr_report,
-        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
-        format_ultraplan_report, format_unknown_slash_command,
+        build_system_prompt, create_managed_session_handle, describe_tool_progress,
+        filter_tool_specs, format_bughunter_report, format_commit_preflight_report,
+        format_commit_skipped_report, format_compact_report, format_cost_report,
+        format_internal_prompt_progress_line, format_issue_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_pr_report, format_resume_report, format_status_report, format_tool_call_start,
+        format_tool_result, format_ultraplan_report, format_unknown_slash_command,
         format_unknown_slash_command_message, list_managed_sessions, normalize_permission_mode,
         parse_args, parse_git_status_branch, parse_git_status_metadata_for,
         parse_git_workspace_summary, permission_policy, print_help_to, push_output_block,
@@ -7016,6 +7018,30 @@ UU conflicted.rs",
 
         std::env::set_current_dir(previous).expect("restore cwd");
         std::fs::remove_dir_all(workspace).expect("workspace should clean up");
+    }
+
+    #[test]
+    fn live_system_prompt_and_system_prompt_command_use_todays_date() {
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let before = runtime::current_date();
+        let prompt = build_system_prompt()
+            .expect("system prompt should build")
+            .join("\n\n");
+        let action = parse_args(&["system-prompt".to_string()]).expect("args should parse");
+        let after = runtime::current_date();
+
+        assert!(
+            [&before, &after]
+                .iter()
+                .any(|today| prompt.contains(&format!("Today's date is {today}."))),
+            "live prompt should carry today's date ({before})"
+        );
+        let CliAction::PrintSystemPrompt { date, .. } = action else {
+            panic!("expected system-prompt action");
+        };
+        assert!(date == before || date == after, "{date} != {before}");
     }
 
     #[test]

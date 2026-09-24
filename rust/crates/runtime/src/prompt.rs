@@ -2,6 +2,7 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::json::JsonValue;
@@ -426,6 +427,35 @@ fn collapse_blank_lines(content: &str) -> String {
         previous_blank = is_blank;
     }
     result
+}
+
+/// Today's date (UTC) as `YYYY-MM-DD`, for the `current_date` of a live system prompt.
+#[must_use]
+pub fn current_date() -> String {
+    let unix_seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    format_unix_date(unix_seconds)
+}
+
+/// Seconds since the Unix epoch to a Gregorian `YYYY-MM-DD` date in UTC (Howard Hinnant's
+/// `civil_from_days`).
+fn format_unix_date(unix_seconds: u64) -> String {
+    let shifted_days = unix_seconds / 86_400 + 719_468;
+    let era = shifted_days / 146_097;
+    let day_of_era = shifted_days % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_from_march = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
+    let month = if month_from_march < 10 {
+        month_from_march + 3
+    } else {
+        month_from_march - 9
+    };
+    let year = era * 400 + year_of_era + u64::from(month <= 2);
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 pub fn load_system_prompt(
@@ -1059,6 +1089,34 @@ mod tests {
         assert!(prompt.contains(r#""GITHUB_TOKEN":"[redacted]""#));
         assert!(prompt.contains(r#""command":"gh-mcp""#));
         assert!(prompt.contains("https://mcp.example/sse?[redacted]"));
+    }
+
+    #[test]
+    fn formats_unix_timestamps_as_utc_calendar_dates() {
+        for (unix_seconds, expected) in [
+            (0, "1970-01-01"),
+            (946_598_400, "1999-12-31"),
+            (951_782_400, "2000-02-29"),
+            (1_709_164_800, "2024-02-29"),
+            (1_790_208_000, "2026-09-24"),
+            (1_790_294_399, "2026-09-24"),
+            (4_107_542_400, "2100-03-01"),
+        ] {
+            assert_eq!(super::format_unix_date(unix_seconds), expected);
+        }
+        let today = super::current_date();
+        assert!(
+            today
+                .chars()
+                .enumerate()
+                .all(|(index, ch)| if index == 4 || index == 7 {
+                    ch == '-'
+                } else {
+                    ch.is_ascii_digit()
+                })
+                && today.len() == "YYYY-MM-DD".len(),
+            "{today}"
+        );
     }
 
     #[test]
