@@ -4,7 +4,11 @@ use serde_json::Value;
 
 use crate::config::RuntimePermissionRuleConfig;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Permission modes. Deliberately not `Ord`: `Prompt` and `Allow` are not
+/// capability levels, so a derived declaration-order comparison would rank
+/// `Prompt` above `DangerFullAccess` and auto-allow every tool. Use
+/// [`PermissionMode::satisfies`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionMode {
     ReadOnly,
     WorkspaceWrite,
@@ -22,6 +26,33 @@ impl PermissionMode {
             Self::DangerFullAccess => "danger-full-access",
             Self::Prompt => "prompt",
             Self::Allow => "allow",
+        }
+    }
+
+    /// Capability rank of the three real access levels. `Prompt` and `Allow`
+    /// have none; as a requirement they fail closed to the highest rank.
+    fn capability_rank(self) -> Option<u8> {
+        match self {
+            Self::ReadOnly => Some(0),
+            Self::WorkspaceWrite => Some(1),
+            Self::DangerFullAccess => Some(2),
+            Self::Prompt | Self::Allow => None,
+        }
+    }
+
+    /// Whether running in this mode grants `required` without asking.
+    /// `Allow` grants everything; `Prompt` grants nothing and always asks.
+    #[must_use]
+    pub fn satisfies(self, required: Self) -> bool {
+        match self {
+            Self::Allow => true,
+            Self::Prompt => false,
+            current => {
+                let required_rank = required.capability_rank().unwrap_or(2);
+                current
+                    .capability_rank()
+                    .is_some_and(|rank| rank >= required_rank)
+            }
         }
     }
 }
@@ -223,10 +254,7 @@ impl PermissionPolicy {
                         prompter,
                     );
                 }
-                if allow_rule.is_some()
-                    || current_mode == PermissionMode::Allow
-                    || current_mode >= required_mode
-                {
+                if allow_rule.is_some() || current_mode.satisfies(required_mode) {
                     return PermissionOutcome::Allow;
                 }
             }
@@ -248,10 +276,7 @@ impl PermissionPolicy {
             );
         }
 
-        if allow_rule.is_some()
-            || current_mode == PermissionMode::Allow
-            || current_mode >= required_mode
-        {
+        if allow_rule.is_some() || current_mode.satisfies(required_mode) {
             return PermissionOutcome::Allow;
         }
 
@@ -540,6 +565,32 @@ mod tests {
             prompter.seen[0].required_mode,
             PermissionMode::DangerFullAccess
         );
+    }
+
+    #[test]
+    fn prompt_mode_prompts_instead_of_auto_allowing() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly);
+        let mut prompter = RecordingPrompter {
+            seen: Vec::new(),
+            allow: false,
+        };
+
+        assert!(matches!(
+            policy.authorize("bash", r#"{"command":"ls"}"#, Some(&mut prompter)),
+            PermissionOutcome::Deny { reason } if reason == "not now"
+        ));
+        assert_eq!(prompter.seen.len(), 1);
+        assert_eq!(prompter.seen[0].current_mode, PermissionMode::Prompt);
+        assert_eq!(
+            prompter.seen[0].required_mode,
+            PermissionMode::DangerFullAccess
+        );
+        assert!(matches!(
+            policy.authorize("read_file", r#"{"path":"README.md"}"#, None),
+            PermissionOutcome::Deny { .. }
+        ));
     }
 
     #[test]
