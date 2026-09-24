@@ -4,6 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 use tokio::runtime::Builder;
 use tokio::time::timeout;
@@ -104,40 +105,62 @@ async fn execute_bash_async(
     sandbox_status: SandboxStatus,
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
+    let timeout_ms = effective_timeout_ms(input.timeout);
     let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Lead a fresh process group so a timeout can kill everything the command
+    // started, including pipelines and `&` background jobs.
+    #[cfg(unix)]
+    command.process_group(0);
 
-    let output_result = if let Some(timeout_ms) = input.timeout {
-        match timeout(Duration::from_millis(timeout_ms), command.output()).await {
-            Ok(result) => (result?, false),
-            Err(_) => {
-                return Ok(BashCommandOutput {
-                    stdout: String::new(),
-                    stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
-                    raw_output_path: None,
-                    interrupted: true,
-                    is_image: None,
-                    background_task_id: None,
-                    backgrounded_by_user: None,
-                    assistant_auto_backgrounded: None,
-                    dangerously_disable_sandbox: input.dangerously_disable_sandbox,
-                    return_code_interpretation: Some(String::from("timeout")),
-                    no_output_expected: Some(true),
-                    structured_content: None,
-                    persisted_output_path: None,
-                    persisted_output_size: None,
-                    sandbox_status: Some(sandbox_status),
-                });
-            }
+    let mut child = command.spawn()?;
+    let process_group = child.id();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let completed = timeout(Duration::from_millis(timeout_ms), async {
+        let (status, stdout, stderr) =
+            tokio::join!(child.wait(), read_capped(stdout), read_capped(stderr));
+        Ok::<_, io::Error>((status?, stdout?, stderr?))
+    })
+    .await;
+
+    let (status, stdout, stderr) = match completed {
+        Ok(Ok(collected)) => collected,
+        Ok(Err(error)) => {
+            kill_process_group(&mut child, process_group).await;
+            return Err(error);
         }
-    } else {
-        (command.output().await?, false)
+        Err(_) => {
+            kill_process_group(&mut child, process_group).await;
+            return Ok(BashCommandOutput {
+                stdout: String::new(),
+                stderr: format!("Command exceeded timeout of {timeout_ms} ms"),
+                raw_output_path: None,
+                interrupted: true,
+                is_image: None,
+                background_task_id: None,
+                backgrounded_by_user: None,
+                assistant_auto_backgrounded: None,
+                dangerously_disable_sandbox: input.dangerously_disable_sandbox,
+                return_code_interpretation: Some(String::from("timeout")),
+                no_output_expected: Some(true),
+                structured_content: None,
+                persisted_output_path: None,
+                persisted_output_size: None,
+                sandbox_status: Some(sandbox_status),
+            });
+        }
     };
 
-    let (output, interrupted) = output_result;
-    let stdout = truncate_output(&String::from_utf8_lossy(&output.stdout));
-    let stderr = truncate_output(&String::from_utf8_lossy(&output.stderr));
+    let interrupted = false;
+    let stdout = truncate_output(&String::from_utf8_lossy(&stdout));
+    let stderr = truncate_output(&String::from_utf8_lossy(&stderr));
     let no_output_expected = Some(stdout.trim().is_empty() && stderr.trim().is_empty());
-    let return_code_interpretation = output.status.code().and_then(|code| {
+    let return_code_interpretation = status.code().and_then(|code| {
         if code == 0 {
             None
         } else {
@@ -162,6 +185,55 @@ async fn execute_bash_async(
         persisted_output_size: None,
         sandbox_status: Some(sandbox_status),
     })
+}
+
+/// Timeout applied when the caller does not pass one (matches upstream).
+const DEFAULT_TIMEOUT_MS: u64 = 120_000;
+/// Longest timeout a caller may request (matches upstream).
+const MAX_TIMEOUT_MS: u64 = 600_000;
+/// Bytes kept per output stream. The rest is drained and dropped so a chatty
+/// command (`yes`) cannot grow memory without bound before its timeout.
+const MAX_CAPTURE_BYTES: usize = 4 * MAX_OUTPUT_BYTES;
+
+fn effective_timeout_ms(requested: Option<u64>) -> u64 {
+    requested.unwrap_or(DEFAULT_TIMEOUT_MS).min(MAX_TIMEOUT_MS)
+}
+
+async fn read_capped<R>(reader: Option<R>) -> io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut captured = Vec::new();
+    let Some(mut reader) = reader else {
+        return Ok(captured);
+    };
+    let mut buffer = vec![0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            return Ok(captured);
+        }
+        let room = MAX_CAPTURE_BYTES.saturating_sub(captured.len());
+        captured.extend_from_slice(&buffer[..read.min(room)]);
+    }
+}
+
+/// Kill the command's whole process group, then the direct child, and reap it.
+/// `process_group` is the child's pid captured at spawn time, because tokio
+/// forgets the pid once the direct child has been reaped while background
+/// jobs in its group are still holding the output pipes open.
+async fn kill_process_group(child: &mut tokio::process::Child, process_group: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(pgid) = process_group.and_then(|pid| i32::try_from(pid).ok()) {
+        let _ = nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(pgid),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = process_group;
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
@@ -279,6 +351,60 @@ mod tests {
         .expect("bash command should execute");
 
         assert!(!output.sandbox_status.expect("sandbox status").enabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_kills_the_command_and_its_background_children() {
+        let _guard = crate::test_env_lock();
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let marker = std::env::temp_dir().join(format!("bash-timeout-marker-{unique}"));
+        let started = std::time::Instant::now();
+
+        let output = execute_bash(BashCommandInput {
+            command: format!("(sleep 1; touch '{}') & sleep 5", marker.display()),
+            timeout: Some(200),
+            description: None,
+            run_in_background: Some(false),
+            dangerously_disable_sandbox: None,
+            namespace_restrictions: None,
+            isolate_network: None,
+            filesystem_mode: None,
+            allowed_mounts: None,
+        })
+        .expect("bash command should execute");
+
+        assert!(output.interrupted);
+        assert!(started.elapsed() < std::time::Duration::from_secs(4));
+        std::thread::sleep(std::time::Duration::from_millis(1_500));
+        assert!(
+            !marker.exists(),
+            "a process started by the timed-out command kept running"
+        );
+    }
+
+    #[test]
+    fn applies_default_and_maximum_timeouts() {
+        assert_eq!(super::effective_timeout_ms(None), 120_000);
+        assert_eq!(super::effective_timeout_ms(Some(250)), 250);
+        assert_eq!(super::effective_timeout_ms(Some(u64::MAX)), 600_000);
+    }
+
+    #[test]
+    fn caps_captured_output_while_draining_the_stream() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime should build");
+        let source = vec![b'x'; 1_000_000];
+
+        let captured = runtime
+            .block_on(super::read_capped(Some(source.as_slice())))
+            .expect("read should succeed");
+
+        assert_eq!(captured.len(), super::MAX_CAPTURE_BYTES);
     }
 }
 

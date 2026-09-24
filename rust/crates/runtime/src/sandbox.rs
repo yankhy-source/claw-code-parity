@@ -228,6 +228,9 @@ pub fn build_linux_sandbox_command(
         "--pid".to_string(),
         "--uts".to_string(),
         "--fork".to_string(),
+        // Without this, killing the launcher (e.g. on a bash timeout) leaves
+        // the namespaced child running.
+        "--kill-child".to_string(),
     ];
     if status.network_active {
         args.push("--net".to_string());
@@ -358,6 +361,21 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
+    }
+
+    #[test]
+    fn linux_launcher_kills_the_namespaced_child_with_the_launcher() {
+        let status = super::SandboxStatus {
+            enabled: true,
+            namespace_active: true,
+            ..super::SandboxStatus::default()
+        };
+
+        if let Some(launcher) =
+            build_linux_sandbox_command("printf hi", Path::new("/workspace"), &status)
+        {
+            assert!(launcher.args.iter().any(|arg| arg == "--kill-child"));
+        }
     }
 
     #[test]
