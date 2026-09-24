@@ -1,7 +1,11 @@
 //! Permission enforcement layer that gates tool execution based on the
 //! active `PermissionPolicy`.
 
+use std::path::Path;
+
+use crate::file_ops::is_path_within_workspace;
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
+use crate::shell_split::{basename, split_simple_commands};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,22 +34,17 @@ impl PermissionEnforcer {
     }
 
     /// Check whether a tool can be executed under the current permission policy.
-    /// Auto-denies when prompting is required but no prompter is provided.
+    /// Auto-denies when prompting is required but no prompter is provided,
+    /// which includes every call in `Prompt` mode.
     #[must_use]
     pub fn check(&self, tool_name: &str, input: &str) -> EnforcementResult {
-        // When the active mode is Prompt, defer to the caller's interactive
-        // prompt flow rather than hard-denying (the enforcer has no prompter).
-        if self.policy.active_mode() == PermissionMode::Prompt {
-            return EnforcementResult::Allowed;
-        }
-
         let outcome = self.policy.authorize(tool_name, input, None);
 
         match outcome {
             PermissionOutcome::Allow => EnforcementResult::Allowed,
             PermissionOutcome::Deny { reason } => {
                 let active_mode = self.policy.active_mode();
-                let required_mode = self.policy.required_mode_for(tool_name);
+                let required_mode = self.policy.required_mode_for_input(tool_name, input);
                 EnforcementResult::Denied {
                     tool: tool_name.to_owned(),
                     active_mode: active_mode.as_str().to_owned(),
@@ -136,102 +135,78 @@ impl PermissionEnforcer {
     }
 }
 
-/// Simple workspace boundary check via string prefix.
+/// Workspace boundary check. Relative paths are resolved against the
+/// workspace root; `..`, symlinks and missing directories are resolved the
+/// same way a write would resolve them (see `file_ops::resolve_write_target`).
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
-        path.to_owned()
-    } else {
-        format!("{workspace_root}/{path}")
+    let Ok(cwd) = std::env::current_dir() else {
+        return false;
     };
-
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
-    } else {
-        format!("{workspace_root}/")
-    };
-
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
+    let root = cwd.join(workspace_root);
+    is_path_within_workspace(Path::new(path), &root, &root)
 }
 
 /// Conservative heuristic: is this bash command read-only?
+///
+/// Every simple command in the line must start with a binary that can
+/// neither write files nor run other programs, and the line must not use
+/// redirections, expansions or subshells (see
+/// `shell_split::split_simple_commands`). Binaries that can write or execute
+/// through their options (`tee`, `xargs`, `env`, `find -delete`, `sed -i`,
+/// `awk` `system()`, `sort -o`, `git`, interpreters, ...) are not listed.
 fn is_read_only_command(command: &str) -> bool {
-    let first_token = command
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-
-    matches!(
-        first_token,
-        "cat"
-            | "head"
-            | "tail"
-            | "less"
-            | "more"
-            | "wc"
-            | "ls"
-            | "find"
-            | "grep"
-            | "rg"
-            | "awk"
-            | "sed"
-            | "echo"
-            | "printf"
-            | "which"
-            | "where"
-            | "whoami"
-            | "pwd"
-            | "env"
-            | "printenv"
-            | "date"
-            | "cal"
-            | "df"
-            | "du"
-            | "free"
-            | "uptime"
-            | "uname"
-            | "file"
-            | "stat"
-            | "diff"
-            | "sort"
-            | "uniq"
-            | "tr"
-            | "cut"
-            | "paste"
-            | "tee"
-            | "xargs"
-            | "test"
-            | "true"
-            | "false"
-            | "type"
-            | "readlink"
-            | "realpath"
-            | "basename"
-            | "dirname"
-            | "sha256sum"
-            | "md5sum"
-            | "b3sum"
-            | "xxd"
-            | "hexdump"
-            | "od"
-            | "strings"
-            | "tree"
-            | "jq"
-            | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
-            | "git"
-            | "gh"
-    ) && !command.contains("-i ")
-        && !command.contains("--in-place")
-        && !command.contains(" > ")
-        && !command.contains(" >> ")
+    let Some(commands) = split_simple_commands(command) else {
+        return false;
+    };
+    !commands.is_empty()
+        && commands.iter().all(|words| {
+            words.first().is_some_and(|program| {
+                matches!(
+                    basename(program),
+                    "cat"
+                        | "head"
+                        | "tail"
+                        | "more"
+                        | "wc"
+                        | "ls"
+                        | "grep"
+                        | "echo"
+                        | "printf"
+                        | "which"
+                        | "where"
+                        | "whoami"
+                        | "pwd"
+                        | "printenv"
+                        | "date"
+                        | "cal"
+                        | "df"
+                        | "du"
+                        | "free"
+                        | "uptime"
+                        | "uname"
+                        | "stat"
+                        | "diff"
+                        | "tr"
+                        | "cut"
+                        | "paste"
+                        | "test"
+                        | "true"
+                        | "false"
+                        | "type"
+                        | "readlink"
+                        | "realpath"
+                        | "basename"
+                        | "dirname"
+                        | "sha256sum"
+                        | "md5sum"
+                        | "b3sum"
+                        | "hexdump"
+                        | "od"
+                        | "strings"
+                        | "jq"
+                )
+            })
+        })
 }
 
 #[cfg(test)]
@@ -321,6 +296,20 @@ mod tests {
     }
 
     #[test]
+    fn prompt_mode_check_denies_tools_without_prompter() {
+        let policy = PermissionPolicy::new(PermissionMode::Prompt)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess);
+        let enforcer = PermissionEnforcer::new(policy);
+
+        let result = enforcer.check("bash", r#"{"command":"rm -rf /tmp/scratch"}"#);
+
+        assert!(matches!(
+            result,
+            EnforcementResult::Denied { ref active_mode, .. } if active_mode == "prompt"
+        ));
+    }
+
+    #[test]
     fn workspace_boundary_check() {
         assert!(is_within_workspace("/workspace/src/main.rs", "/workspace"));
         assert!(is_within_workspace("/workspace", "/workspace"));
@@ -329,13 +318,89 @@ mod tests {
     }
 
     #[test]
+    fn workspace_boundary_rejects_parent_dir_traversal() {
+        assert!(!is_within_workspace(
+            "/workspace/../etc/passwd",
+            "/workspace"
+        ));
+        assert!(!is_within_workspace("src/../../etc/passwd", "/workspace"));
+
+        let enforcer = make_enforcer(PermissionMode::WorkspaceWrite);
+        assert!(matches!(
+            enforcer.check_file_write("/workspace/../etc/passwd", "/workspace"),
+            EnforcementResult::Denied { .. }
+        ));
+    }
+
+    #[test]
+    fn workspace_boundary_resolves_relative_roots_against_the_current_dir() {
+        let _guard = crate::test_env_lock();
+        assert!(is_within_workspace("src/main.rs", "relative-ws"));
+        assert!(!is_within_workspace("/etc/passwd", "relative-ws"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_boundary_follows_symlinked_directories() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should move forward")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("enforcer-symlink-{unique}"));
+        let workspace = root.join("ws");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        std::fs::create_dir_all(&outside).expect("outside dir");
+        std::os::unix::fs::symlink(&outside, workspace.join("link")).expect("symlink");
+
+        let workspace_str = workspace.to_string_lossy().into_owned();
+        let escaped = workspace.join("link").join("new.txt");
+
+        assert!(!is_within_workspace(
+            escaped.to_string_lossy().as_ref(),
+            &workspace_str
+        ));
+        assert!(is_within_workspace(
+            workspace.join("inside.txt").to_string_lossy().as_ref(),
+            &workspace_str
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn read_only_command_heuristic() {
         assert!(is_read_only_command("cat file.txt"));
         assert!(is_read_only_command("grep pattern file"));
-        assert!(is_read_only_command("git log --oneline"));
+        // git can push, commit, rewrite config or run hooks, so its first
+        // token alone does not make a command read-only.
+        assert!(!is_read_only_command("git log --oneline"));
         assert!(!is_read_only_command("rm file.txt"));
         assert!(!is_read_only_command("echo test > file.txt"));
         assert!(!is_read_only_command("sed -i 's/a/b/' file"));
+    }
+
+    #[test]
+    fn read_only_heuristic_rejects_writers_and_chained_commands() {
+        for command in [
+            "tee ~/.bashrc",
+            "git push -f",
+            "python3 -c 'open(\"x\", \"w\").write(\"pwned\")'",
+            "cat x; rm -rf y",
+            "cat x && rm -rf y",
+            "cat x | xargs rm",
+            "find . -delete",
+            "sort -o out.txt in.txt",
+            "env rm -rf y",
+            "awk 'BEGIN { system(\"rm -rf y\") }'",
+            "cat $(rm -rf y)",
+            "grep -r pattern . >> out.txt",
+        ] {
+            assert!(
+                !is_read_only_command(command),
+                "{command:?} must not count as read-only"
+            );
+        }
+        assert!(is_read_only_command("cat Cargo.toml | grep -i version"));
     }
 
     #[test]
@@ -440,15 +505,15 @@ mod tests {
     fn bash_heuristic_full_path_prefix() {
         // given
         let full_path_command = "/usr/bin/cat Cargo.toml";
-        let git_path_command = "/usr/local/bin/git status";
+        let grep_path_command = "/usr/local/bin/grep -n main src/lib.rs";
 
         // when
         let cat_result = is_read_only_command(full_path_command);
-        let git_result = is_read_only_command(git_path_command);
+        let grep_result = is_read_only_command(grep_path_command);
 
         // then
         assert!(cat_result);
-        assert!(git_result);
+        assert!(grep_result);
     }
 
     #[test]

@@ -26,6 +26,7 @@ mod remote;
 pub mod sandbox;
 mod session;
 pub mod session_control;
+mod shell_split;
 mod sse;
 pub mod stale_branch;
 pub mod summary_compression;
@@ -56,10 +57,10 @@ pub use conversation::{
     ToolExecutor, TurnSummary,
 };
 pub use file_ops::{
-    edit_file, edit_file_in_workspace, glob_search, grep_search, is_symlink_escape, read_file,
-    read_file_in_workspace, write_file, write_file_in_workspace, EditFileOutput, GlobSearchOutput,
-    GrepSearchInput, GrepSearchOutput, ReadFileOutput, StructuredPatchHunk, TextFilePayload,
-    WriteFileOutput,
+    edit_file, edit_file_in_workspace, glob_search, grep_search, is_path_within_workspace,
+    is_symlink_escape, read_file, read_file_in_workspace, resolve_write_target, write_file,
+    write_file_in_workspace, EditFileOutput, GlobSearchOutput, GrepSearchInput, GrepSearchOutput,
+    ReadFileOutput, StructuredPatchHunk, TextFilePayload, WriteFileOutput,
 };
 pub use hooks::{
     HookAbortSignal, HookEvent, HookProgressEvent, HookProgressReporter, HookRunResult, HookRunner,

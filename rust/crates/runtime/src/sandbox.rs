@@ -103,6 +103,88 @@ impl SandboxConfig {
             allowed_mounts: allowed_mounts_override.unwrap_or_else(|| self.allowed_mounts.clone()),
         }
     }
+
+    /// Resolve the request for one command from overrides supplied by the
+    /// model in the tool call. Unlike [`Self::resolve_request`], these may
+    /// only tighten the configured sandbox: attempts to loosen it are ignored
+    /// and the offending input fields are returned so the caller can report
+    /// them. Relaxing the sandbox is the operator's decision (settings), not
+    /// the model's.
+    #[must_use]
+    pub fn resolve_request_for_call(
+        &self,
+        enabled_override: Option<bool>,
+        namespace_override: Option<bool>,
+        network_override: Option<bool>,
+        filesystem_mode_override: Option<FilesystemIsolationMode>,
+        allowed_mounts_override: Option<Vec<String>>,
+    ) -> (SandboxRequest, Vec<&'static str>) {
+        let configured = self.resolve_request(None, None, None, None, None);
+        let mut ignored = Vec::new();
+        let mut tighten = |configured: bool, requested: Option<bool>, field: &'static str| {
+            if configured && requested == Some(false) {
+                ignored.push(field);
+            }
+            configured || requested == Some(true)
+        };
+        let enabled = tighten(
+            configured.enabled,
+            enabled_override,
+            "dangerouslyDisableSandbox",
+        );
+        let namespace_restrictions = tighten(
+            configured.namespace_restrictions,
+            namespace_override,
+            "namespaceRestrictions",
+        );
+        let network_isolation = tighten(
+            configured.network_isolation,
+            network_override,
+            "isolateNetwork",
+        );
+        let filesystem_mode = match filesystem_mode_override {
+            Some(mode) if mode.strictness() >= configured.filesystem_mode.strictness() => mode,
+            Some(_) => {
+                ignored.push("filesystemMode");
+                configured.filesystem_mode
+            }
+            None => configured.filesystem_mode,
+        };
+        let allowed_mounts = match allowed_mounts_override {
+            Some(mounts) => {
+                let (kept, extra): (Vec<_>, Vec<_>) = mounts
+                    .into_iter()
+                    .partition(|mount| configured.allowed_mounts.contains(mount));
+                if !extra.is_empty() {
+                    ignored.push("allowedMounts");
+                }
+                kept
+            }
+            None => configured.allowed_mounts,
+        };
+
+        (
+            SandboxRequest {
+                enabled,
+                namespace_restrictions,
+                network_isolation,
+                filesystem_mode,
+                allowed_mounts,
+            },
+            ignored,
+        )
+    }
+}
+
+impl FilesystemIsolationMode {
+    /// `Off` < `AllowList` (workspace plus listed mounts) < `WorkspaceOnly`.
+    fn strictness(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::AllowList => 1,
+            Self::WorkspaceOnly => 2,
+        }
+    }
 }
 
 #[must_use]
@@ -163,9 +245,18 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     let container = detect_container_environment();
     let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
     let network_supported = namespace_supported;
-    let filesystem_active =
-        request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
+    // Nothing enforces the filesystem modes yet: the launcher only enters an
+    // unprivileged mount namespace, which is a writable copy of the host's
+    // mounts, and the fallback only redirects HOME/TMPDIR. Report isolation
+    // as inactive rather than claim a guarantee that does not hold.
+    let filesystem_active = false;
     let mut fallback_reasons = Vec::new();
+    if request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off {
+        fallback_reasons.push(format!(
+            "filesystem isolation ({}) is not enforced; commands can read and write outside the workspace",
+            request.filesystem_mode.as_str()
+        ));
+    }
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
         fallback_reasons
@@ -228,6 +319,9 @@ pub fn build_linux_sandbox_command(
         "--pid".to_string(),
         "--uts".to_string(),
         "--fork".to_string(),
+        // Without this, killing the launcher (e.g. on a bash timeout) leaves
+        // the namespaced child running.
+        "--kill-child".to_string(),
     ];
     if status.network_active {
         args.push("--net".to_string());
@@ -358,6 +452,97 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
+    }
+
+    #[test]
+    fn reports_unenforced_filesystem_isolation_as_inactive() {
+        for mode in [
+            FilesystemIsolationMode::WorkspaceOnly,
+            FilesystemIsolationMode::AllowList,
+        ] {
+            let config = SandboxConfig {
+                filesystem_mode: Some(mode),
+                allowed_mounts: vec!["logs".to_string()],
+                ..SandboxConfig::default()
+            };
+
+            let status = super::resolve_sandbox_status(&config, Path::new("/workspace"));
+
+            assert_eq!(status.filesystem_mode, mode);
+            assert!(!status.filesystem_active, "{mode:?} restricts nothing");
+            assert!(status
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("filesystem isolation")
+                    && reason.contains("not enforced")));
+        }
+    }
+
+    #[test]
+    fn per_call_overrides_only_tighten_the_configured_sandbox() {
+        let strict = SandboxConfig {
+            enabled: Some(true),
+            namespace_restrictions: Some(true),
+            network_isolation: Some(true),
+            filesystem_mode: Some(FilesystemIsolationMode::AllowList),
+            allowed_mounts: vec!["logs".to_string(), "cache".to_string()],
+        };
+        let (request, ignored) = strict.resolve_request_for_call(
+            Some(false),
+            Some(false),
+            Some(false),
+            Some(FilesystemIsolationMode::Off),
+            Some(vec!["logs".to_string(), "/".to_string()]),
+        );
+        assert!(request.enabled && request.namespace_restrictions && request.network_isolation);
+        assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
+        assert_eq!(request.allowed_mounts, vec!["logs"]);
+        assert_eq!(
+            ignored,
+            vec![
+                "dangerouslyDisableSandbox",
+                "namespaceRestrictions",
+                "isolateNetwork",
+                "filesystemMode",
+                "allowedMounts"
+            ]
+        );
+
+        let permissive = SandboxConfig {
+            enabled: Some(false),
+            namespace_restrictions: Some(false),
+            network_isolation: Some(false),
+            filesystem_mode: Some(FilesystemIsolationMode::Off),
+            allowed_mounts: Vec::new(),
+        };
+        let (request, ignored) = permissive.resolve_request_for_call(
+            Some(true),
+            Some(true),
+            Some(true),
+            Some(FilesystemIsolationMode::WorkspaceOnly),
+            None,
+        );
+        assert!(request.enabled && request.namespace_restrictions && request.network_isolation);
+        assert_eq!(
+            request.filesystem_mode,
+            FilesystemIsolationMode::WorkspaceOnly
+        );
+        assert!(ignored.is_empty());
+    }
+
+    #[test]
+    fn linux_launcher_kills_the_namespaced_child_with_the_launcher() {
+        let status = super::SandboxStatus {
+            enabled: true,
+            namespace_active: true,
+            ..super::SandboxStatus::default()
+        };
+
+        if let Some(launcher) =
+            build_linux_sandbox_command("printf hi", Path::new("/workspace"), &status)
+        {
+            assert!(launcher.args.iter().any(|arg| arg == "--kill-child"));
+        }
     }
 
     #[test]

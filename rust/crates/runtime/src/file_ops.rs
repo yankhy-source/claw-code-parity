@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use glob::Pattern;
@@ -40,6 +40,82 @@ fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Re
         ));
     }
     Ok(())
+}
+
+/// Resolve the absolute location that writing to `path` would touch.
+///
+/// Relative paths are joined onto `base`. The deepest ancestor that exists is
+/// canonicalized, which resolves symlinks and `..` against the real
+/// filesystem, and the remaining not-yet-existing components are appended.
+/// Fails closed with `PermissionDenied` when a remaining component is `..`
+/// (`create_dir_all` would create the missing directories and then climb out
+/// of them) or names an entry that exists but cannot be canonicalized, such as
+/// a dangling symlink that a later write would follow.
+pub fn resolve_write_target(path: &Path, base: &Path) -> io::Result<PathBuf> {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    };
+    let components = candidate.components().collect::<Vec<_>>();
+
+    for split in (1..=components.len()).rev() {
+        let existing = components[..split].iter().collect::<PathBuf>();
+        let Ok(mut resolved) = existing.canonicalize() else {
+            continue;
+        };
+        for component in &components[split..] {
+            match component {
+                Component::CurDir => {}
+                Component::Normal(name) => {
+                    resolved.push(name);
+                    match fs::symlink_metadata(&resolved) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
+                        Ok(_) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::PermissionDenied,
+                                format!(
+                                    "path {} exists but cannot be resolved (dangling symlink?)",
+                                    resolved.display()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "path {} climbs out of a directory that does not exist yet",
+                            candidate.display()
+                        ),
+                    ));
+                }
+            }
+        }
+        return Ok(resolved);
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no existing ancestor for {}", candidate.display()),
+    ))
+}
+
+/// Returns true when a write to `path` (relative paths are joined onto
+/// `base`) would land inside `workspace_root`, using the same resolution as
+/// [`resolve_write_target`]. Any resolution failure counts as outside.
+#[must_use]
+pub fn is_path_within_workspace(path: &Path, base: &Path, workspace_root: &Path) -> bool {
+    let Ok(root) = resolve_write_target(workspace_root, base) else {
+        return false;
+    };
+    resolve_write_target(path, base).is_ok_and(|target| target.starts_with(root))
+}
+
+fn canonical_workspace_root(workspace_root: &Path) -> io::Result<PathBuf> {
+    resolve_write_target(workspace_root, &std::env::current_dir()?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -167,10 +243,16 @@ pub fn read_file(
     offset: Option<usize>,
     limit: Option<usize>,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    read_file_at(&normalize_path(path)?, offset, limit)
+}
 
+fn read_file_at(
+    absolute_path: &Path,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> io::Result<ReadFileOutput> {
     // Check file size before reading
-    let metadata = fs::metadata(&absolute_path)?;
+    let metadata = fs::metadata(absolute_path)?;
     if metadata.len() > MAX_READ_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -183,14 +265,14 @@ pub fn read_file(
     }
 
     // Detect binary files
-    if is_binary_file(&absolute_path)? {
+    if is_binary_file(absolute_path)? {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "file appears to be binary",
         ));
     }
 
-    let content = fs::read_to_string(&absolute_path)?;
+    let content = fs::read_to_string(absolute_path)?;
     let lines: Vec<&str> = content.lines().collect();
     let start_index = offset.unwrap_or(0).min(lines.len());
     let end_index = limit.map_or(lines.len(), |limit| {
@@ -211,6 +293,10 @@ pub fn read_file(
 }
 
 pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
+    write_file_at(&normalize_path_allow_missing(path)?, content)
+}
+
+fn write_file_at(absolute_path: &Path, content: &str) -> io::Result<WriteFileOutput> {
     if content.len() > MAX_WRITE_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -222,12 +308,11 @@ pub fn write_file(path: &str, content: &str) -> io::Result<WriteFileOutput> {
         ));
     }
 
-    let absolute_path = normalize_path_allow_missing(path)?;
-    let original_file = fs::read_to_string(&absolute_path).ok();
+    let original_file = fs::read_to_string(absolute_path).ok();
     if let Some(parent) = absolute_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&absolute_path, content)?;
+    fs::write(absolute_path, content)?;
 
     Ok(WriteFileOutput {
         kind: if original_file.is_some() {
@@ -249,8 +334,24 @@ pub fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
-    let original_file = fs::read_to_string(&absolute_path)?;
+    let absolute_path = if old_string.is_empty() {
+        normalize_path_allow_missing(path)?
+    } else {
+        normalize_path(path)?
+    };
+    edit_file_at(&absolute_path, old_string, new_string, replace_all)
+}
+
+fn edit_file_at(
+    absolute_path: &Path,
+    old_string: &str,
+    new_string: &str,
+    replace_all: bool,
+) -> io::Result<EditFileOutput> {
+    if old_string.is_empty() {
+        return edit_file_with_empty_old_string(absolute_path, new_string, replace_all);
+    }
+    let original_file = fs::read_to_string(absolute_path)?;
     if old_string == new_string {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -269,7 +370,7 @@ pub fn edit_file(
     } else {
         original_file.replacen(old_string, new_string, 1)
     };
-    fs::write(&absolute_path, &updated)?;
+    fs::write(absolute_path, &updated)?;
 
     Ok(EditFileOutput {
         file_path: absolute_path.to_string_lossy().into_owned(),
@@ -277,6 +378,48 @@ pub fn edit_file(
         new_string: new_string.to_owned(),
         original_file: original_file.clone(),
         structured_patch: make_patch(&original_file, &updated),
+        user_modified: false,
+        replace_all,
+        git_diff: None,
+    })
+}
+
+/// An empty `old_string` matches between every character (`"abc".replace("",
+/// "X")` is `"XaXbXcX"`), so, like upstream, it may only create a missing file
+/// or fill an empty one.
+fn edit_file_with_empty_old_string(
+    absolute_path: &Path,
+    new_string: &str,
+    replace_all: bool,
+) -> io::Result<EditFileOutput> {
+    let original_file = match fs::read_to_string(absolute_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    if !original_file.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string must not be empty when the file already has content",
+        ));
+    }
+    if new_string.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string and new_string must differ",
+        ));
+    }
+    if let Some(parent) = absolute_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(absolute_path, new_string)?;
+
+    Ok(EditFileOutput {
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        old_string: String::new(),
+        new_string: new_string.to_owned(),
+        structured_patch: make_patch(&original_file, new_string),
+        original_file,
         user_modified: false,
         replace_all,
         git_diff: None,
@@ -551,25 +694,23 @@ pub fn read_file_in_workspace(
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
     let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    read_file(path, offset, limit)
+    validate_workspace_boundary(&absolute_path, &canonical_workspace_root(workspace_root)?)?;
+    read_file_at(&absolute_path, offset, limit)
 }
 
 /// Write a file with workspace boundary enforcement.
+///
+/// The target is resolved once with [`resolve_write_target`] and the write goes
+/// to exactly that validated path, so the path is not re-resolved between the
+/// check and the write.
 pub fn write_file_in_workspace(
     path: &str,
     content: &str,
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
-    let absolute_path = normalize_path_allow_missing(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    write_file(path, content)
+    let absolute_path = resolve_write_target(Path::new(path), &std::env::current_dir()?)?;
+    validate_workspace_boundary(&absolute_path, &canonical_workspace_root(workspace_root)?)?;
+    write_file_at(&absolute_path, content)
 }
 
 /// Edit a file with workspace boundary enforcement.
@@ -580,12 +721,13 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    edit_file(path, old_string, new_string, replace_all)
+    let absolute_path = if old_string.is_empty() {
+        resolve_write_target(Path::new(path), &std::env::current_dir()?)?
+    } else {
+        normalize_path(path)?
+    };
+    validate_workspace_boundary(&absolute_path, &canonical_workspace_root(workspace_root)?)?;
+    edit_file_at(&absolute_path, old_string, new_string, replace_all)
 }
 
 /// Check whether a path is a symlink that resolves outside the workspace.
@@ -607,7 +749,7 @@ mod tests {
 
     use super::{
         edit_file, glob_search, grep_search, is_symlink_escape, read_file, read_file_in_workspace,
-        write_file, GrepSearchInput, MAX_WRITE_SIZE,
+        write_file, write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -638,6 +780,38 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    #[test]
+    fn edit_rejects_empty_old_string_when_file_has_content() {
+        let path = temp_path("edit-empty-old-string.txt");
+        let path_str = path.to_string_lossy().into_owned();
+        write_file(&path_str, "abc").expect("initial write should succeed");
+
+        for replace_all in [true, false] {
+            let error = edit_file(&path_str, "", "// hdr\n", replace_all)
+                .expect_err("an empty old_string must not match between every character");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(std::fs::read_to_string(&path).expect("file"), "abc");
+        }
+    }
+
+    #[test]
+    fn edit_with_empty_old_string_creates_missing_or_fills_empty_file() {
+        let empty = temp_path("edit-empty-file.txt");
+        std::fs::write(&empty, "").expect("empty file should write");
+        edit_file(empty.to_string_lossy().as_ref(), "", "hello\n", false)
+            .expect("an empty file can be filled");
+        assert_eq!(std::fs::read_to_string(&empty).expect("file"), "hello\n");
+
+        let missing = temp_path("edit-missing-dir").join("new.txt");
+        let output = edit_file(missing.to_string_lossy().as_ref(), "", "created\n", false)
+            .expect("a missing file is created");
+        assert_eq!(output.original_file, "");
+        assert_eq!(
+            std::fs::read_to_string(&missing).expect("file"),
+            "created\n"
+        );
     }
 
     #[test]
@@ -685,6 +859,55 @@ mod tests {
         let error = result.unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(error.to_string().contains("escapes workspace"));
+    }
+
+    #[test]
+    fn write_in_workspace_rejects_parent_dir_through_missing_directory() {
+        let root = temp_path("workspace-dotdot");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        let escape = workspace
+            .join("missing")
+            .join("..")
+            .join("..")
+            .join("escaped.txt");
+
+        let error = write_file_in_workspace(escape.to_string_lossy().as_ref(), "pwned", &workspace)
+            .expect_err("`..` through a missing directory must not escape the workspace");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!root.join("escaped.txt").exists());
+        assert!(!workspace.join("missing").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_in_workspace_rejects_dangling_symlink() {
+        let root = temp_path("workspace-dangling");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        let outside = root.join("outside.txt");
+        let link = workspace.join("link.txt");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink should create");
+
+        let error = write_file_in_workspace(link.to_string_lossy().as_ref(), "pwned", &workspace)
+            .expect_err("a dangling symlink must not redirect the write outside the workspace");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!outside.exists());
+    }
+
+    #[test]
+    fn write_in_workspace_allows_new_nested_file_inside_workspace() {
+        let workspace = temp_path("workspace-nested");
+        std::fs::create_dir_all(&workspace).expect("workspace dir should be created");
+        let nested = workspace.join("a").join("b").join("new.txt");
+
+        let output = write_file_in_workspace(nested.to_string_lossy().as_ref(), "ok", &workspace)
+            .expect("writes inside the workspace should succeed");
+
+        assert_eq!(output.kind, "create");
+        assert_eq!(std::fs::read_to_string(&nested).expect("file"), "ok");
     }
 
     #[test]

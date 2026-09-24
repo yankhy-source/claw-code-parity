@@ -1192,10 +1192,16 @@ fn execute_tool_with_enforcer(
         "Skill" => from_value::<SkillInput>(input).and_then(run_skill),
         "Agent" => from_value::<AgentInput>(input).and_then(run_agent),
         "ToolSearch" => from_value::<ToolSearchInput>(input).and_then(run_tool_search),
-        "NotebookEdit" => from_value::<NotebookEditInput>(input).and_then(run_notebook_edit),
+        "NotebookEdit" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<NotebookEditInput>(input).and_then(run_notebook_edit)
+        }
         "Sleep" => from_value::<SleepInput>(input).and_then(run_sleep),
         "SendUserMessage" | "Brief" => from_value::<BriefInput>(input).and_then(run_brief),
-        "Config" => from_value::<ConfigInput>(input).and_then(run_config),
+        "Config" => {
+            maybe_enforce_permission_check(enforcer, name, input)?;
+            from_value::<ConfigInput>(input).and_then(run_config)
+        }
         "EnterPlanMode" => from_value::<EnterPlanModeInput>(input).and_then(run_enter_plan_mode),
         "ExitPlanMode" => from_value::<ExitPlanModeInput>(input).and_then(run_exit_plan_mode),
         "StructuredOutput" => {
@@ -5377,6 +5383,58 @@ mod tests {
         let replayed_output: serde_json::Value = serde_json::from_str(&replayed).expect("json");
         assert_eq!(replayed_output["status"], "prompt_accepted");
         assert_eq!(replayed_output["prompt_delivery_attempts"], 2);
+    }
+
+    #[test]
+    fn workspace_write_enforcer_blocks_file_escapes_and_config_escalation() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = temp_path("enforcer-workspace");
+        let workspace = root.join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&workspace).expect("set cwd");
+
+        let policy = permission_policy_for_mode(PermissionMode::WorkspaceWrite)
+            .with_workspace_root(&workspace);
+        let registry = GlobalToolRegistry::builtin().with_enforcer(PermissionEnforcer::new(policy));
+
+        let outside = root.join("outside.txt");
+        let write = registry.execute("write_file", &json!({"path": outside, "content": "pwned"}));
+        let notebook = root.join("outside.ipynb");
+        let notebook_source = r#"{"cells":[{"cell_type":"code","id":"c1","metadata":{},"source":["a"],"outputs":[],"execution_count":null}],"metadata":{},"nbformat":4,"nbformat_minor":5}"#;
+        std::fs::write(&notebook, notebook_source).expect("notebook");
+        let notebook_edit = registry.execute(
+            "NotebookEdit",
+            &json!({"notebook_path": notebook, "cell_id": "c1", "new_source": "pwned"}),
+        );
+        let config = registry.execute(
+            "Config",
+            &json!({"setting": "permissions.defaultMode", "value": "dontAsk"}),
+        );
+        let inside = registry.execute(
+            "write_file",
+            &json!({"path": "inside.txt", "content": "fine"}),
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+
+        assert!(write
+            .expect_err("write outside the workspace must be denied")
+            .contains("outside the workspace root"));
+        assert!(!outside.exists());
+        notebook_edit.expect_err("NotebookEdit outside the workspace must be denied");
+        assert_eq!(
+            std::fs::read_to_string(&notebook).expect("notebook"),
+            notebook_source
+        );
+        assert!(config
+            .expect_err("Config must not grant danger-full-access from workspace-write")
+            .contains("danger-full-access"));
+        assert!(!workspace.join(".claw").join("settings.local.json").exists());
+        inside.expect("writes inside the workspace stay allowed");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

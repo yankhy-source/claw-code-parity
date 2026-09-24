@@ -7,10 +7,19 @@
 //! - `sedValidation` — validate sed expressions before execution
 //! - `pathValidation` — detect suspicious path patterns
 //! - `commandSemantics` — classify command intent
+//!
+//! Not wired into the bash tool. In read-only and workspace-write modes bash
+//! already requires `danger-full-access`, so it is denied or prompted before
+//! these checks could matter; in danger-full-access mode, turning `Warn` into
+//! prompts would change the default mode's contract and deny every
+//! non-interactive run, and the substring heuristics both misfire (`../`,
+//! `~/`) and are trivially bypassed (`sh -c`, `$(printf rm)`). These checks
+//! are advisory helpers, not a security boundary.
 
 use std::path::Path;
 
 use crate::permissions::PermissionMode;
+use crate::shell_split::command_segments;
 
 /// Result of validating a bash command before execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +114,31 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
         return ValidationResult::Allow;
     }
 
+    // Check every command in chains, pipelines, substitutions and subshells,
+    // not just the first one (`cat x; rm -rf y`).
+    for segment in command_segments(command) {
+        let result = validate_read_only_command(&segment, mode);
+        if result != ValidationResult::Allow {
+            return result;
+        }
+    }
+
+    // Check for write redirections.
+    for &redir in WRITE_REDIRECTIONS {
+        if command.contains(redir) {
+            return ValidationResult::Block {
+                reason: format!(
+                    "Command contains write redirection '{redir}' which is not allowed in read-only mode"
+                ),
+            };
+        }
+    }
+
+    ValidationResult::Allow
+}
+
+/// Read-only checks for a single command segment.
+fn validate_read_only_command(command: &str, mode: PermissionMode) -> ValidationResult {
     let first_command = extract_first_command(command);
 
     // Check for write commands.
@@ -137,17 +171,6 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
             if inner_result != ValidationResult::Allow {
                 return inner_result;
             }
-        }
-    }
-
-    // Check for write redirections.
-    for &redir in WRITE_REDIRECTIONS {
-        if command.contains(redir) {
-            return ValidationResult::Block {
-                reason: format!(
-                    "Command contains write redirection '{redir}' which is not allowed in read-only mode"
-                ),
-            };
         }
     }
 
@@ -675,33 +698,36 @@ fn extract_sudo_inner(command: &str) -> &str {
     }
 }
 
-/// Find the end of a value in `KEY=value rest` (handles basic quoting).
+/// Find the end of the value in `KEY=value rest`, where `s` is the text right
+/// after `=`. Returns the byte offset into `s` of the whitespace that ends the
+/// value, or `None` when the value runs to the end of the string.
+///
+/// Whitespace right after `=` means the value is empty and the next word is
+/// the command, so the offset is 0. The offset is always computed on `s`
+/// itself and always lands on ASCII whitespace, so slicing `s` with it is
+/// valid UTF-8.
 fn find_end_of_value(s: &str) -> Option<usize> {
-    let s = s.trim_start();
-    if s.is_empty() {
-        return None;
-    }
-
-    let first = s.as_bytes()[0];
-    if first == b'"' || first == b'\'' {
-        let quote = first;
-        let mut i = 1;
-        while i < s.len() {
-            if s.as_bytes()[i] == quote && (i == 0 || s.as_bytes()[i - 1] != b'\\') {
-                // Skip past quote.
-                i += 1;
-                // Find next whitespace.
-                while i < s.len() && !s.as_bytes()[i].is_ascii_whitespace() {
-                    i += 1;
-                }
-                return if i < s.len() { Some(i) } else { None };
+    let bytes = s.as_bytes();
+    let mut quote = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(open) = quote {
+            if byte == open {
+                quote = None;
+            } else if open == b'"' && byte == b'\\' {
+                index += 1;
             }
-            i += 1;
+        } else if byte.is_ascii_whitespace() {
+            return Some(index);
+        } else if byte == b'"' || byte == b'\'' {
+            quote = Some(byte);
+        } else if byte == b'\\' {
+            index += 1;
         }
-        None
-    } else {
-        s.find(char::is_whitespace)
+        index += 1;
     }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -1000,5 +1026,39 @@ mod tests {
     #[test]
     fn extracts_plain_command() {
         assert_eq!(extract_first_command("grep -r pattern ."), "grep");
+    }
+
+    #[test]
+    fn extracts_command_after_empty_assignment_without_panicking() {
+        // Whitespace right after `=` means an empty value; the next word is
+        // the command. Multi-byte characters must not be sliced mid-char.
+        assert_eq!(extract_first_command("FOO= éé x"), "éé");
+        assert_eq!(extract_first_command("FOO= rm -rf /x"), "rm");
+        assert_eq!(extract_first_command("FOO='a b' ls -la"), "ls");
+        assert_eq!(extract_first_command("FOO=é ls"), "ls");
+    }
+
+    #[test]
+    fn read_only_validation_checks_every_command_in_a_chain() {
+        for command in [
+            "FOO= rm -rf /x",
+            "cat x; rm -rf y",
+            "ls && rm -rf y",
+            "cat x | tee out",
+            "echo $(rm -rf y)",
+            "git status; git push origin main",
+        ] {
+            assert!(
+                matches!(
+                    validate_read_only(command, PermissionMode::ReadOnly),
+                    ValidationResult::Block { .. }
+                ),
+                "{command:?} must be blocked in read-only mode"
+            );
+        }
+        assert_eq!(
+            validate_read_only("cat Cargo.toml | grep version", PermissionMode::ReadOnly),
+            ValidationResult::Allow
+        );
     }
 }
