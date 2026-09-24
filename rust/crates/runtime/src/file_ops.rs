@@ -334,7 +334,12 @@ pub fn edit_file(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
-    edit_file_at(&normalize_path(path)?, old_string, new_string, replace_all)
+    let absolute_path = if old_string.is_empty() {
+        normalize_path_allow_missing(path)?
+    } else {
+        normalize_path(path)?
+    };
+    edit_file_at(&absolute_path, old_string, new_string, replace_all)
 }
 
 fn edit_file_at(
@@ -343,6 +348,9 @@ fn edit_file_at(
     new_string: &str,
     replace_all: bool,
 ) -> io::Result<EditFileOutput> {
+    if old_string.is_empty() {
+        return edit_file_with_empty_old_string(absolute_path, new_string, replace_all);
+    }
     let original_file = fs::read_to_string(absolute_path)?;
     if old_string == new_string {
         return Err(io::Error::new(
@@ -370,6 +378,48 @@ fn edit_file_at(
         new_string: new_string.to_owned(),
         original_file: original_file.clone(),
         structured_patch: make_patch(&original_file, &updated),
+        user_modified: false,
+        replace_all,
+        git_diff: None,
+    })
+}
+
+/// An empty `old_string` matches between every character (`"abc".replace("",
+/// "X")` is `"XaXbXcX"`), so, like upstream, it may only create a missing file
+/// or fill an empty one.
+fn edit_file_with_empty_old_string(
+    absolute_path: &Path,
+    new_string: &str,
+    replace_all: bool,
+) -> io::Result<EditFileOutput> {
+    let original_file = match fs::read_to_string(absolute_path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    if !original_file.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string must not be empty when the file already has content",
+        ));
+    }
+    if new_string.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "old_string and new_string must differ",
+        ));
+    }
+    if let Some(parent) = absolute_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(absolute_path, new_string)?;
+
+    Ok(EditFileOutput {
+        file_path: absolute_path.to_string_lossy().into_owned(),
+        old_string: String::new(),
+        new_string: new_string.to_owned(),
+        structured_patch: make_patch(&original_file, new_string),
+        original_file,
         user_modified: false,
         replace_all,
         git_diff: None,
@@ -671,7 +721,11 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
+    let absolute_path = if old_string.is_empty() {
+        resolve_write_target(Path::new(path), &std::env::current_dir()?)?
+    } else {
+        normalize_path(path)?
+    };
     validate_workspace_boundary(&absolute_path, &canonical_workspace_root(workspace_root)?)?;
     edit_file_at(&absolute_path, old_string, new_string, replace_all)
 }
@@ -726,6 +780,38 @@ mod tests {
         let output = edit_file(path.to_string_lossy().as_ref(), "alpha", "omega", true)
             .expect("edit should succeed");
         assert!(output.replace_all);
+    }
+
+    #[test]
+    fn edit_rejects_empty_old_string_when_file_has_content() {
+        let path = temp_path("edit-empty-old-string.txt");
+        let path_str = path.to_string_lossy().into_owned();
+        write_file(&path_str, "abc").expect("initial write should succeed");
+
+        for replace_all in [true, false] {
+            let error = edit_file(&path_str, "", "// hdr\n", replace_all)
+                .expect_err("an empty old_string must not match between every character");
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+            assert_eq!(std::fs::read_to_string(&path).expect("file"), "abc");
+        }
+    }
+
+    #[test]
+    fn edit_with_empty_old_string_creates_missing_or_fills_empty_file() {
+        let empty = temp_path("edit-empty-file.txt");
+        std::fs::write(&empty, "").expect("empty file should write");
+        edit_file(empty.to_string_lossy().as_ref(), "", "hello\n", false)
+            .expect("an empty file can be filled");
+        assert_eq!(std::fs::read_to_string(&empty).expect("file"), "hello\n");
+
+        let missing = temp_path("edit-missing-dir").join("new.txt");
+        let output = edit_file(missing.to_string_lossy().as_ref(), "", "created\n", false)
+            .expect("a missing file is created");
+        assert_eq!(output.original_file, "");
+        assert_eq!(
+            std::fs::read_to_string(&missing).expect("file"),
+            "created\n"
+        );
     }
 
     #[test]
