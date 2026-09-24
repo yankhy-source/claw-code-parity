@@ -282,7 +282,7 @@ fn prepare_command(
 
     let mut prepared = Command::new("sh");
     prepared.arg("-c").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
+    if redirects_home_into_workspace(sandbox_status) {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
@@ -309,11 +309,18 @@ fn prepare_tokio_command(
 
     let mut prepared = TokioCommand::new("sh");
     prepared.arg("-c").arg(command).current_dir(cwd);
-    if sandbox_status.filesystem_active {
+    if redirects_home_into_workspace(sandbox_status) {
         prepared.env("HOME", cwd.join(".sandbox-home"));
         prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
     }
     prepared
+}
+
+/// HOME/TMPDIR are pointed into the workspace whenever a filesystem mode is
+/// requested. This is a convenience, not isolation (see
+/// `resolve_sandbox_status_for_request`, which reports it as inactive).
+fn redirects_home_into_workspace(sandbox_status: &SandboxStatus) -> bool {
+    sandbox_status.enabled && sandbox_status.filesystem_mode != FilesystemIsolationMode::Off
 }
 
 fn prepare_sandbox_dirs(cwd: &std::path::Path) {

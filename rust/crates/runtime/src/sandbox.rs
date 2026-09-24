@@ -245,9 +245,18 @@ pub fn resolve_sandbox_status_for_request(request: &SandboxRequest, cwd: &Path) 
     let container = detect_container_environment();
     let namespace_supported = cfg!(target_os = "linux") && unshare_user_namespace_works();
     let network_supported = namespace_supported;
-    let filesystem_active =
-        request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off;
+    // Nothing enforces the filesystem modes yet: the launcher only enters an
+    // unprivileged mount namespace, which is a writable copy of the host's
+    // mounts, and the fallback only redirects HOME/TMPDIR. Report isolation
+    // as inactive rather than claim a guarantee that does not hold.
+    let filesystem_active = false;
     let mut fallback_reasons = Vec::new();
+    if request.enabled && request.filesystem_mode != FilesystemIsolationMode::Off {
+        fallback_reasons.push(format!(
+            "filesystem isolation ({}) is not enforced; commands can read and write outside the workspace",
+            request.filesystem_mode.as_str()
+        ));
+    }
 
     if request.enabled && request.namespace_restrictions && !namespace_supported {
         fallback_reasons
@@ -443,6 +452,30 @@ mod tests {
         assert!(request.network_isolation);
         assert_eq!(request.filesystem_mode, FilesystemIsolationMode::AllowList);
         assert_eq!(request.allowed_mounts, vec!["tmp"]);
+    }
+
+    #[test]
+    fn reports_unenforced_filesystem_isolation_as_inactive() {
+        for mode in [
+            FilesystemIsolationMode::WorkspaceOnly,
+            FilesystemIsolationMode::AllowList,
+        ] {
+            let config = SandboxConfig {
+                filesystem_mode: Some(mode),
+                allowed_mounts: vec!["logs".to_string()],
+                ..SandboxConfig::default()
+            };
+
+            let status = super::resolve_sandbox_status(&config, Path::new("/workspace"));
+
+            assert_eq!(status.filesystem_mode, mode);
+            assert!(!status.filesystem_active, "{mode:?} restricts nothing");
+            assert!(status
+                .fallback_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("filesystem isolation")
+                    && reason.contains("not enforced")));
+        }
     }
 
     #[test]
