@@ -92,7 +92,7 @@
   {
     "name": "auto_compact_triggered",
     "category": "session-compaction",
-    "description": "Verifies auto-compact fires when cumulative input tokens exceed the configured threshold.",
+    "description": "Verifies auto-compact fires when the latest request's input tokens exceed the configured threshold.",
     "parity_refs": [
       "Session compaction behavior matching",
       "auto_compaction threshold from env"

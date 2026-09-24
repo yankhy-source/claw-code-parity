@@ -1,4 +1,5 @@
 use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
+use crate::usage::TokenUsage;
 
 const COMPACT_CONTINUATION_PREAMBLE: &str =
     "This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.\n\n";
@@ -135,6 +136,12 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
     let mut compacted_session = session.clone();
     compacted_session.messages = compacted_messages;
     compacted_session.record_compaction(summary.clone(), removed.len());
+    if let Some(compaction) = compacted_session.compaction.as_mut() {
+        compaction.removed_usage = removed
+            .iter()
+            .filter_map(|message| message.usage)
+            .fold(compaction.removed_usage, TokenUsage::saturating_add);
+    }
 
     CompactionResult {
         summary,

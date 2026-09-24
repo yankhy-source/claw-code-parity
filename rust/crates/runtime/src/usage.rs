@@ -85,6 +85,28 @@ impl TokenUsage {
             + self.cache_read_input_tokens
     }
 
+    /// Size of the prompt this usage was reported for: fresh input plus cached input.
+    #[must_use]
+    pub fn context_input_tokens(self) -> u32 {
+        self.input_tokens
+            .saturating_add(self.cache_creation_input_tokens)
+            .saturating_add(self.cache_read_input_tokens)
+    }
+
+    #[must_use]
+    pub fn saturating_add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_creation_input_tokens: self
+                .cache_creation_input_tokens
+                .saturating_add(other.cache_creation_input_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(other.cache_read_input_tokens),
+        }
+    }
+
     #[must_use]
     pub fn estimate_cost_usd(self) -> UsageCostEstimate {
         self.estimate_cost_usd_with_pricing(ModelPricing::default_sonnet_tier())
@@ -175,6 +197,9 @@ impl UsageTracker {
     #[must_use]
     pub fn from_session(session: &Session) -> Self {
         let mut tracker = Self::new();
+        if let Some(compaction) = &session.compaction {
+            tracker.cumulative = compaction.removed_usage;
+        }
         for message in &session.messages {
             if let Some(usage) = message.usage {
                 tracker.record(usage);
@@ -185,10 +210,7 @@ impl UsageTracker {
 
     pub fn record(&mut self, usage: TokenUsage) {
         self.latest_turn = usage;
-        self.cumulative.input_tokens += usage.input_tokens;
-        self.cumulative.output_tokens += usage.output_tokens;
-        self.cumulative.cache_creation_input_tokens += usage.cache_creation_input_tokens;
-        self.cumulative.cache_read_input_tokens += usage.cache_read_input_tokens;
+        self.cumulative = self.cumulative.saturating_add(usage);
         self.turns += 1;
     }
 
@@ -211,6 +233,7 @@ impl UsageTracker {
 #[cfg(test)]
 mod tests {
     use super::{format_usd, pricing_for_model, TokenUsage, UsageTracker};
+    use crate::compact::{compact_session, CompactionConfig};
     use crate::session::{ContentBlock, ConversationMessage, MessageRole, Session};
 
     #[test]
@@ -303,5 +326,77 @@ mod tests {
         let tracker = UsageTracker::from_session(&session);
         assert_eq!(tracker.turns(), 1);
         assert_eq!(tracker.cumulative_usage().total_tokens(), 8);
+    }
+
+    #[test]
+    fn cumulative_usage_survives_compaction_and_reload() {
+        let usage = |input_tokens| TokenUsage {
+            input_tokens,
+            output_tokens: 3,
+            cache_creation_input_tokens: 2,
+            cache_read_input_tokens: 1,
+        };
+        let mut session = Session::new();
+        for (index, input_tokens) in [10, 20, 30, 40].into_iter().enumerate() {
+            session
+                .messages
+                .push(ConversationMessage::user_text(format!("request {index}")));
+            session
+                .messages
+                .push(ConversationMessage::assistant_with_usage(
+                    vec![ContentBlock::Text {
+                        text: format!("answer {index}"),
+                    }],
+                    Some(usage(input_tokens)),
+                ));
+        }
+        let before = UsageTracker::from_session(&session).cumulative_usage();
+        let config = CompactionConfig {
+            preserve_recent_messages: 2,
+            max_estimated_tokens: 0,
+        };
+
+        let first = compact_session(&session, config);
+        let mut follow_up = first.compacted_session.clone();
+        follow_up
+            .messages
+            .push(ConversationMessage::user_text("request 4"));
+        follow_up
+            .messages
+            .push(ConversationMessage::assistant_with_usage(
+                vec![ContentBlock::Text {
+                    text: "answer 4".to_string(),
+                }],
+                Some(usage(50)),
+            ));
+        let second = compact_session(&follow_up, config);
+        let path = std::env::temp_dir().join(format!(
+            "runtime-usage-compaction-{}.jsonl",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should be after epoch")
+                .as_nanos()
+        ));
+        second
+            .compacted_session
+            .save_to_path(&path)
+            .expect("session should save");
+        let restored = Session::load_from_path(&path).expect("session should load");
+        std::fs::remove_file(&path).expect("temp session should be removable");
+
+        assert!(first.removed_message_count > 0 && second.removed_message_count > 0);
+        assert_eq!(
+            UsageTracker::from_session(&first.compacted_session).cumulative_usage(),
+            before
+        );
+        let mut expected = before;
+        expected.input_tokens += 50;
+        expected.output_tokens += 3;
+        expected.cache_creation_input_tokens += 2;
+        expected.cache_read_input_tokens += 1;
+        assert_eq!(
+            UsageTracker::from_session(&restored).cumulative_usage(),
+            expected
+        );
     }
 }

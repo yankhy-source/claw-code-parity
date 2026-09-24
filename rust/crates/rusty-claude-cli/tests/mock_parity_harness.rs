@@ -683,7 +683,7 @@ fn assert_plugin_tool_roundtrip(_: &HarnessWorkspace, run: &ScenarioRun) {
 
 fn assert_auto_compact_triggered(_: &HarnessWorkspace, run: &ScenarioRun) {
     // Validates that the auto_compaction field is present in JSON output (format parity).
-    // Trigger behavior is covered by conversation::tests::auto_compacts_when_cumulative_input_threshold_is_crossed.
+    // Trigger behavior is covered by conversation::tests::auto_compacts_when_latest_request_context_crosses_threshold.
     assert_eq!(run.response["iterations"], Value::from(1));
     assert_eq!(run.response["tool_uses"], Value::Array(Vec::new()));
     assert!(

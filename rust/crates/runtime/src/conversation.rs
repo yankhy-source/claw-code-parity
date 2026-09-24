@@ -123,6 +123,9 @@ pub struct ConversationRuntime<C, T> {
     usage_tracker: UsageTracker,
     hook_runner: HookRunner,
     auto_compaction_input_tokens_threshold: u32,
+    /// `usage_tracker.turns()` when the runtime was built or last auto-compacted; only usage
+    /// recorded after that describes the context that is about to be sent.
+    auto_compaction_usage_mark: u32,
     hook_abort_signal: HookAbortSignal,
     hook_progress_reporter: Option<Box<dyn HookProgressReporter>>,
     session_tracer: Option<SessionTracer>,
@@ -162,6 +165,7 @@ where
         feature_config: &RuntimeFeatureConfig,
     ) -> Self {
         let usage_tracker = UsageTracker::from_session(&session);
+        let auto_compaction_usage_mark = usage_tracker.turns();
         Self {
             session,
             api_client,
@@ -172,6 +176,7 @@ where
             usage_tracker,
             hook_runner: HookRunner::from_feature_config(feature_config),
             auto_compaction_input_tokens_threshold: auto_compaction_threshold_from_env(),
+            auto_compaction_usage_mark,
             hook_abort_signal: HookAbortSignal::default(),
             hook_progress_reporter: None,
             session_tracer: None,
@@ -298,6 +303,7 @@ where
         let mut tool_results = Vec::new();
         let mut prompt_cache_events = Vec::new();
         let mut iterations = 0;
+        let mut auto_compaction = None;
 
         loop {
             iterations += 1;
@@ -309,6 +315,8 @@ where
                 return Err(error);
             }
 
+            // A long tool loop can outgrow the context window before the turn ends.
+            auto_compaction = merge_auto_compaction(auto_compaction, self.maybe_auto_compact());
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
                 messages: self.session.messages.clone(),
@@ -459,7 +467,7 @@ where
             }
         }
 
-        let auto_compaction = self.maybe_auto_compact();
+        let auto_compaction = merge_auto_compaction(auto_compaction, self.maybe_auto_compact());
 
         let summary = TurnSummary {
             assistant_messages,
@@ -505,8 +513,14 @@ where
     }
 
     fn maybe_auto_compact(&mut self) -> Option<AutoCompactionEvent> {
-        if self.usage_tracker.cumulative_usage().input_tokens
-            < self.auto_compaction_input_tokens_threshold
+        // Every request resends the whole conversation, so the latest request's prompt size is
+        // the current context size; the sum over all requests grows quadratically instead.
+        if self.usage_tracker.turns() == self.auto_compaction_usage_mark
+            || self
+                .usage_tracker
+                .current_turn_usage()
+                .context_input_tokens()
+                < self.auto_compaction_input_tokens_threshold
         {
             return None;
         }
@@ -524,6 +538,7 @@ where
         }
 
         self.session = result.compacted_session;
+        self.auto_compaction_usage_mark = self.usage_tracker.turns();
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
@@ -634,6 +649,18 @@ where
         attributes.insert("iteration".to_string(), Value::from(iteration as u64));
         attributes.insert("error".to_string(), Value::String(error.to_string()));
         session_tracer.record("turn_failed", attributes);
+    }
+}
+
+fn merge_auto_compaction(
+    earlier: Option<AutoCompactionEvent>,
+    later: Option<AutoCompactionEvent>,
+) -> Option<AutoCompactionEvent> {
+    match (earlier, later) {
+        (Some(earlier), Some(later)) => Some(AutoCompactionEvent {
+            removed_message_count: earlier.removed_message_count + later.removed_message_count,
+        }),
+        (earlier, later) => earlier.or(later),
     }
 }
 
@@ -1452,7 +1479,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compacts_when_cumulative_input_threshold_is_crossed() {
+    fn auto_compacts_when_latest_request_context_crosses_threshold() {
         struct SimpleApi;
         impl ApiClient for SimpleApi {
             fn stream(
@@ -1504,6 +1531,169 @@ mod tests {
             })
         );
         assert_eq!(runtime.session().messages[0].role, MessageRole::System);
+    }
+
+    /// Every call but the last asks for one `noop` tool; call `n` reports `usages[n]`.
+    struct ToolLoopApi {
+        usages: Vec<Option<TokenUsage>>,
+        requests: std::rc::Rc<std::cell::RefCell<Vec<ApiRequest>>>,
+    }
+
+    impl ApiClient for ToolLoopApi {
+        fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
+            let call = {
+                let mut requests = self.requests.borrow_mut();
+                requests.push(request);
+                requests.len() - 1
+            };
+            let mut events = if call + 1 < self.usages.len() {
+                vec![AssistantEvent::ToolUse {
+                    id: format!("tool-{call}"),
+                    name: "noop".to_string(),
+                    input: "{}".to_string(),
+                }]
+            } else {
+                vec![AssistantEvent::TextDelta("done".to_string())]
+            };
+            if let Some(usage) = self.usages[call] {
+                events.push(AssistantEvent::Usage(usage));
+            }
+            events.push(AssistantEvent::MessageStop);
+            Ok(events)
+        }
+    }
+
+    fn input_usage(input_tokens: u32) -> TokenUsage {
+        TokenUsage {
+            input_tokens,
+            output_tokens: 10,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        }
+    }
+
+    fn seeded_session() -> Session {
+        let mut session = Session::new();
+        session.messages = vec![
+            crate::session::ConversationMessage::user_text("one"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "two".to_string(),
+            }]),
+            crate::session::ConversationMessage::user_text("three"),
+            crate::session::ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "four".to_string(),
+            }]),
+        ];
+        session
+    }
+
+    fn tool_loop_runtime(
+        session: Session,
+        usages: Vec<Option<TokenUsage>>,
+    ) -> (
+        ConversationRuntime<ToolLoopApi, StaticToolExecutor>,
+        std::rc::Rc<std::cell::RefCell<Vec<ApiRequest>>>,
+    ) {
+        let requests = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let runtime = ConversationRuntime::new(
+            session,
+            ToolLoopApi {
+                usages,
+                requests: requests.clone(),
+            },
+            StaticToolExecutor::new().register("noop", |_| Ok("ok".to_string())),
+            PermissionPolicy::new(PermissionMode::DangerFullAccess),
+            vec!["system".to_string()],
+        )
+        .with_auto_compaction_input_tokens_threshold(100_000);
+        (runtime, requests)
+    }
+
+    #[test]
+    fn does_not_auto_compact_when_only_the_sum_of_small_requests_crosses_threshold() {
+        // Each request resends the whole (40k token) context; four of them add up to 160k,
+        // but the context itself never gets near the 100k threshold.
+        let (mut runtime, requests) =
+            tool_loop_runtime(seeded_session(), vec![Some(input_usage(40_000)); 4]);
+
+        let summary = runtime
+            .run_turn("run some tools", None)
+            .expect("turn should succeed");
+
+        assert_eq!(requests.borrow().len(), 4);
+        assert_eq!(summary.auto_compaction, None);
+        assert_eq!(runtime.session().messages[0].role, MessageRole::User);
+        assert_eq!(runtime.session().messages.len(), 4 + 1 + 7);
+    }
+
+    #[test]
+    fn auto_compacts_mid_turn_before_the_next_request_overflows() {
+        let (mut runtime, requests) = tool_loop_runtime(
+            seeded_session(),
+            vec![Some(input_usage(120_000)), Some(input_usage(10_000))],
+        );
+
+        let summary = runtime
+            .run_turn("run a tool", None)
+            .expect("turn should succeed");
+
+        let requests = requests.borrow();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[1].messages[0].role,
+            MessageRole::System,
+            "the request after the oversized one should already be compacted"
+        );
+        assert!(matches!(
+            requests[1].messages[1].blocks.as_slice(),
+            [ContentBlock::Text { text }] if text == "four"
+        ));
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn counts_cache_tokens_toward_auto_compaction_context_size() {
+        let (mut runtime, _requests) = tool_loop_runtime(
+            seeded_session(),
+            vec![Some(TokenUsage {
+                input_tokens: 2_000,
+                output_tokens: 10,
+                cache_creation_input_tokens: 8_000,
+                cache_read_input_tokens: 95_000,
+            })],
+        );
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(
+            summary.auto_compaction,
+            Some(AutoCompactionEvent {
+                removed_message_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_stale_restored_usage_when_the_provider_reports_none() {
+        // A restored (for example already compacted) session still carries the usage of an
+        // old oversized request; it says nothing about the context sent in this turn.
+        let mut session = seeded_session();
+        session.messages[1].usage = Some(input_usage(150_000));
+        let (mut runtime, _requests) = tool_loop_runtime(session, vec![None]);
+
+        let summary = runtime
+            .run_turn("trigger", None)
+            .expect("turn should succeed");
+
+        assert_eq!(summary.auto_compaction, None);
+        assert_eq!(runtime.session().messages.len(), 6);
     }
 
     #[test]

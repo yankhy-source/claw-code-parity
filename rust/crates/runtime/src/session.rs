@@ -52,6 +52,8 @@ pub struct SessionCompaction {
     pub count: u32,
     pub removed_message_count: usize,
     pub summary: String,
+    /// Token usage of every message compacted away so far, so usage totals survive compaction.
+    pub removed_usage: TokenUsage,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -197,10 +199,16 @@ impl Session {
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
         self.touch();
         let count = self.compaction.as_ref().map_or(1, |value| value.count + 1);
+        let removed_usage = self
+            .compaction
+            .as_ref()
+            .map(|value| value.removed_usage)
+            .unwrap_or_default();
         self.compaction = Some(SessionCompaction {
             count,
             removed_message_count,
             summary: summary.into(),
+            removed_usage,
         });
     }
 
@@ -657,6 +665,12 @@ impl SessionCompaction {
             "summary".to_string(),
             JsonValue::String(self.summary.clone()),
         );
+        if self.removed_usage != TokenUsage::default() {
+            object.insert(
+                "removed_usage".to_string(),
+                usage_to_json(self.removed_usage),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -681,6 +695,12 @@ impl SessionCompaction {
             "summary".to_string(),
             JsonValue::String(self.summary.clone()),
         );
+        if self.removed_usage != TokenUsage::default() {
+            object.insert(
+                "removed_usage".to_string(),
+                usage_to_json(self.removed_usage),
+            );
+        }
         Ok(JsonValue::Object(object))
     }
 
@@ -692,6 +712,11 @@ impl SessionCompaction {
             count: required_u32(object, "count")?,
             removed_message_count: required_usize(object, "removed_message_count")?,
             summary: required_string(object, "summary")?,
+            removed_usage: object
+                .get("removed_usage")
+                .map(usage_from_json)
+                .transpose()?
+                .unwrap_or_default(),
         })
     }
 }
