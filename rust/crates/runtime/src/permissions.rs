@@ -377,7 +377,7 @@ impl PermissionRule {
                     let matcher = parse_rule_matcher(content);
                     return Self {
                         raw: trimmed.to_string(),
-                        tool_name: tool_name.to_string(),
+                        tool_name: canonical_tool_name(tool_name),
                         matcher,
                     };
                 }
@@ -386,13 +386,13 @@ impl PermissionRule {
 
         Self {
             raw: trimmed.to_string(),
-            tool_name: trimmed.to_string(),
+            tool_name: canonical_tool_name(trimmed),
             matcher: PermissionRuleMatcher::Any,
         }
     }
 
     fn matches(&self, tool_name: &str, input: &str) -> bool {
-        if self.tool_name != tool_name {
+        if self.tool_name != canonical_tool_name(tool_name) {
             return false;
         }
 
@@ -404,6 +404,23 @@ impl PermissionRule {
             PermissionRuleMatcher::Prefix(prefix) => extract_permission_subject(input)
                 .is_some_and(|candidate| candidate.starts_with(prefix)),
         }
+    }
+}
+
+/// Normalize a tool name for rule matching: case-insensitive, `-` and `_`
+/// interchangeable, and the Claude Code spellings (`Read`, `Write`, `Edit`,
+/// `Glob`, `Grep`) mapped to the registry names, mirroring `--allowedTools`.
+/// Without this, rules such as `Bash(rm -rf:*)` never matched the `bash` tool
+/// and were silently ignored.
+fn canonical_tool_name(name: &str) -> String {
+    let normalized = name.trim().replace('-', "_").to_ascii_lowercase();
+    match normalized.as_str() {
+        "read" => "read_file".to_string(),
+        "write" => "write_file".to_string(),
+        "edit" => "edit_file".to_string(),
+        "glob" => "glob_search".to_string(),
+        "grep" => "grep_search".to_string(),
+        _ => normalized,
     }
 }
 
@@ -627,6 +644,36 @@ mod tests {
             policy.authorize("bash", r#"{"command":"rm -rf /tmp/x"}"#, None),
             PermissionOutcome::Deny { reason } if reason.contains("denied by rule")
         ));
+    }
+
+    #[test]
+    fn rule_tool_names_match_case_insensitively_and_by_alias() {
+        let rules = RuntimePermissionRuleConfig::new(
+            vec!["Write".to_string()],
+            vec!["Bash(rm -rf:*)".to_string(), "Read".to_string()],
+            Vec::new(),
+        );
+        let full_access = PermissionPolicy::new(PermissionMode::DangerFullAccess)
+            .with_tool_requirement("bash", PermissionMode::DangerFullAccess)
+            .with_tool_requirement("read_file", PermissionMode::ReadOnly)
+            .with_permission_rules(&rules);
+
+        assert!(matches!(
+            full_access.authorize("bash", r#"{"command":"rm -rf /tmp/x"}"#, None),
+            PermissionOutcome::Deny { reason } if reason.contains("Bash(rm -rf:*)")
+        ));
+        assert!(matches!(
+            full_access.authorize("read_file", r#"{"path":"secrets.env"}"#, None),
+            PermissionOutcome::Deny { reason } if reason.contains("'Read'")
+        ));
+
+        let read_only = PermissionPolicy::new(PermissionMode::ReadOnly)
+            .with_tool_requirement("write_file", PermissionMode::WorkspaceWrite)
+            .with_permission_rules(&rules);
+        assert_eq!(
+            read_only.authorize("write_file", r#"{"path":"notes.txt"}"#, None),
+            PermissionOutcome::Allow
+        );
     }
 
     #[test]
