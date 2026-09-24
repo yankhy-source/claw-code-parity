@@ -3830,17 +3830,19 @@ mod tests {
             }]),
         ];
 
+        // Preserving 2 messages would start the kept tail with the tool result, which must
+        // stay with the assistant message before it, so keep only the latest message.
         let result = handle_slash_command(
             "/compact",
             &session,
             CompactionConfig {
-                preserve_recent_messages: 2,
+                preserve_recent_messages: 1,
                 max_estimated_tokens: 1,
             },
         )
         .expect("slash command should be handled");
 
-        assert!(result.message.contains("Compacted 2 messages"));
+        assert!(result.message.contains("Compacted 3 messages"));
         assert_eq!(result.session.messages[0].role, MessageRole::System);
     }
 

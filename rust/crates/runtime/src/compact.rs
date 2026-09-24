@@ -101,10 +101,23 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         .first()
         .and_then(extract_existing_compacted_summary);
     let compacted_prefix_len = usize::from(existing_summary.is_some());
-    let keep_from = session
+    let mut keep_from = session
         .messages
         .len()
         .saturating_sub(config.preserve_recent_messages);
+    // A tool result must stay with the assistant tool_use it answers; otherwise the
+    // provider rejects the compacted session. Pull the boundary back to that message.
+    while keep_from > compacted_prefix_len && carries_tool_result(&session.messages[keep_from]) {
+        keep_from -= 1;
+    }
+    if keep_from <= compacted_prefix_len {
+        return CompactionResult {
+            summary: String::new(),
+            formatted_summary: String::new(),
+            compacted_session: session.clone(),
+            removed_message_count: 0,
+        };
+    }
     let removed = &session.messages[compacted_prefix_len..keep_from];
     let preserved = session.messages[keep_from..].to_vec();
     let summary =
@@ -129,6 +142,14 @@ pub fn compact_session(session: &Session, config: CompactionConfig) -> Compactio
         compacted_session,
         removed_message_count: removed.len(),
     }
+}
+
+fn carries_tool_result(message: &ConversationMessage) -> bool {
+    message.role == MessageRole::Tool
+        || message
+            .blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
 }
 
 fn compacted_summary_prefix_len(session: &Session) -> usize {
@@ -544,15 +565,17 @@ mod tests {
             },
         ];
 
+        // Preserving 2 messages would start the kept tail with the tool result, which must
+        // stay with the assistant message before it, so keep only the latest message.
         let result = compact_session(
             &session,
             CompactionConfig {
-                preserve_recent_messages: 2,
+                preserve_recent_messages: 1,
                 max_estimated_tokens: 1,
             },
         );
 
-        assert_eq!(result.removed_message_count, 2);
+        assert_eq!(result.removed_message_count, 3);
         assert_eq!(
             result.compacted_session.messages[0].role,
             MessageRole::System
@@ -566,7 +589,7 @@ mod tests {
         assert!(should_compact(
             &session,
             CompactionConfig {
-                preserve_recent_messages: 2,
+                preserve_recent_messages: 1,
                 max_estimated_tokens: 1,
             }
         ));
@@ -655,6 +678,119 @@ mod tests {
                 max_estimated_tokens: 1,
             }
         ));
+    }
+
+    fn tool_use(id: &str) -> ContentBlock {
+        ContentBlock::ToolUse {
+            id: id.to_string(),
+            name: "bash".to_string(),
+            input: format!("{{\"command\":\"echo {id}\"}}"),
+        }
+    }
+
+    fn assert_every_preserved_tool_result_has_its_tool_use(messages: &[ConversationMessage]) {
+        for (index, message) in messages.iter().enumerate() {
+            for block in &message.blocks {
+                let ContentBlock::ToolResult { tool_use_id, .. } = block else {
+                    continue;
+                };
+                let paired = messages[..index].iter().any(|earlier| {
+                    earlier.blocks.iter().any(|candidate| {
+                        matches!(candidate, ContentBlock::ToolUse { id, .. } if id == tool_use_id)
+                    })
+                });
+                assert!(
+                    paired,
+                    "tool_result {tool_use_id} was preserved without its tool_use: {messages:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn never_splits_tool_use_from_tool_result_across_two_tool_iterations() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("first request ".repeat(50)),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "first answer ".repeat(50),
+            }]),
+            ConversationMessage::user_text("run two commands"),
+            ConversationMessage::assistant(vec![tool_use("t1")]),
+            ConversationMessage::tool_result("t1", "bash", "one", false),
+            ConversationMessage::assistant(vec![tool_use("t2")]),
+            ConversationMessage::tool_result("t2", "bash", "two", false),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "done".to_string(),
+            }]),
+        ];
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 4,
+                max_estimated_tokens: 0,
+            },
+        );
+
+        let preserved = &result.compacted_session.messages[1..];
+        assert_ne!(preserved[0].role, MessageRole::Tool);
+        assert_every_preserved_tool_result_has_its_tool_use(preserved);
+        assert_eq!(result.removed_message_count, 3);
+        assert_eq!(preserved.len(), 5);
+    }
+
+    #[test]
+    fn never_splits_parallel_tool_uses_from_their_results() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::user_text("inspect three files ".repeat(50)),
+            ConversationMessage::assistant(vec![tool_use("a"), tool_use("b"), tool_use("c")]),
+            ConversationMessage::tool_result("a", "bash", "alpha", false),
+            ConversationMessage::tool_result("b", "bash", "beta", false),
+            ConversationMessage::tool_result("c", "bash", "gamma", false),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "all three inspected".to_string(),
+            }]),
+        ];
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 4,
+                max_estimated_tokens: 0,
+            },
+        );
+
+        let preserved = &result.compacted_session.messages[1..];
+        assert_eq!(preserved[0].role, MessageRole::Assistant);
+        assert_every_preserved_tool_result_has_its_tool_use(preserved);
+        assert_eq!(result.removed_message_count, 1);
+    }
+
+    #[test]
+    fn skips_compaction_when_only_a_tool_exchange_would_be_removed() {
+        let mut session = Session::new();
+        session.messages = vec![
+            ConversationMessage::assistant(vec![tool_use("a"), tool_use("b")]),
+            ConversationMessage::tool_result("a", "bash", "alpha ".repeat(100), false),
+            ConversationMessage::tool_result("b", "bash", "beta ".repeat(100), false),
+            ConversationMessage::user_text("next"),
+            ConversationMessage::assistant(vec![ContentBlock::Text {
+                text: "ok".to_string(),
+            }]),
+        ];
+
+        let result = compact_session(
+            &session,
+            CompactionConfig {
+                preserve_recent_messages: 3,
+                max_estimated_tokens: 0,
+            },
+        );
+
+        assert_eq!(result.removed_message_count, 0);
+        assert_eq!(result.compacted_session, session);
     }
 
     #[test]
