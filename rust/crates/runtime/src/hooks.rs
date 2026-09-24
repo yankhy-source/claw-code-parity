@@ -427,10 +427,10 @@ impl HookRunner {
         child.stderr(Stdio::piped());
         child.env("HOOK_EVENT", event.as_str());
         child.env("HOOK_TOOL_NAME", tool_name);
-        child.env("HOOK_TOOL_INPUT", tool_input);
+        set_payload_env(&mut child, "HOOK_TOOL_INPUT", tool_input);
         child.env("HOOK_TOOL_IS_ERROR", if is_error { "1" } else { "0" });
         if let Some(tool_output) = tool_output {
-            child.env("HOOK_TOOL_OUTPUT", tool_output);
+            set_payload_env(&mut child, "HOOK_TOOL_OUTPUT", tool_output);
         }
 
         match child.output_with_stdin(payload.as_bytes(), abort_signal) {
@@ -642,11 +642,25 @@ fn shell_command(command: &str) -> CommandWithStdin {
     #[cfg(not(windows))]
     let command_builder = {
         let mut command_builder = Command::new("sh");
-        command_builder.arg("-lc").arg(command);
+        command_builder.arg("-c").arg(command);
         CommandWithStdin::new(command_builder)
     };
 
     command_builder
+}
+
+/// Largest tool payload mirrored into a `HOOK_*` environment variable. Linux
+/// refuses to spawn a process whose single environment entry exceeds 128 KiB
+/// (`MAX_ARG_STRLEN`), so larger payloads are delivered on stdin only and the
+/// omission is flagged through `<NAME>_OMITTED=1`.
+const MAX_HOOK_ENV_PAYLOAD_BYTES: usize = 32 * 1024;
+
+fn set_payload_env(child: &mut CommandWithStdin, key: &str, value: &str) {
+    if value.len() <= MAX_HOOK_ENV_PAYLOAD_BYTES {
+        child.env(key, value);
+    } else {
+        child.env(format!("{key}_OMITTED"), "1");
+    }
 }
 
 struct CommandWithStdin {
@@ -688,22 +702,63 @@ impl CommandWithStdin {
         abort_signal: Option<&HookAbortSignal>,
     ) -> std::io::Result<CommandExecution> {
         let mut child = self.command.spawn()?;
-        if let Some(mut child_stdin) = child.stdin.take() {
-            child_stdin.write_all(stdin)?;
+        // Feed stdin and drain stdout/stderr on helper threads so that neither a
+        // hook that never reads its payload nor one that writes more than a pipe
+        // buffer can stall the runner or defeat the abort signal.
+        if let Some(child_stdin) = child.stdin.take() {
+            spawn_stdin_writer(child_stdin, stdin.to_vec());
         }
+        let stdout_reader = child.stdout.take().map(spawn_pipe_reader);
+        let stderr_reader = child.stderr.take().map(spawn_pipe_reader);
 
-        loop {
+        let status = loop {
             if abort_signal.is_some_and(HookAbortSignal::is_aborted) {
                 let _ = child.kill();
-                let _ = child.wait_with_output();
+                let _ = child.wait();
                 return Ok(CommandExecution::Cancelled);
             }
 
             match child.try_wait()? {
-                Some(_) => return child.wait_with_output().map(CommandExecution::Finished),
+                Some(status) => break status,
                 None => thread::sleep(Duration::from_millis(20)),
             }
-        }
+        };
+
+        Ok(CommandExecution::Finished(std::process::Output {
+            status,
+            stdout: join_pipe_reader(stdout_reader)?,
+            stderr: join_pipe_reader(stderr_reader)?,
+        }))
+    }
+}
+
+/// Writes the hook payload to the child's stdin on a detached thread. A hook
+/// that exits without consuming its input closes the pipe; that is not an error.
+fn spawn_stdin_writer(mut child_stdin: std::process::ChildStdin, payload: Vec<u8>) {
+    thread::spawn(move || {
+        let _ = child_stdin.write_all(&payload);
+    });
+}
+
+type PipeReader = thread::JoinHandle<std::io::Result<Vec<u8>>>;
+
+fn spawn_pipe_reader<R>(mut pipe: R) -> PipeReader
+where
+    R: std::io::Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = Vec::new();
+        pipe.read_to_end(&mut buffer)?;
+        Ok(buffer)
+    })
+}
+
+fn join_pipe_reader(reader: Option<PipeReader>) -> std::io::Result<Vec<u8>> {
+    match reader {
+        Some(handle) => handle
+            .join()
+            .map_err(|_| std::io::Error::other("hook output reader thread panicked"))?,
+        None => Ok(Vec::new()),
     }
 }
 
@@ -745,6 +800,63 @@ mod tests {
         let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
 
         assert_eq!(result, HookRunResult::allow(vec!["pre ok".to_string()]));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn hook_that_ignores_large_stdin_payload_is_not_a_failure() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet("printf 'ignored input'")],
+            Vec::new(),
+            Vec::new(),
+        ));
+        let payload = format!(r#"{{"content":"{}"}}"#, "x".repeat(512 * 1024));
+
+        let result = runner.run_pre_tool_use("Write", &payload);
+
+        assert_eq!(
+            result,
+            HookRunResult::allow(vec!["ignored input".to_string()])
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn oversized_tool_input_is_flagged_instead_of_mirrored_into_env() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet(
+                "printf '%s|%s' \"${HOOK_TOOL_INPUT_OMITTED:-0}\" \"${#HOOK_TOOL_INPUT}\"",
+            )],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let small = runner.run_pre_tool_use("Read", r#"{"path":"a"}"#);
+        let large = runner.run_pre_tool_use(
+            "Write",
+            &format!(r#"{{"content":"{}"}}"#, "y".repeat(200 * 1024)),
+        );
+
+        assert_eq!(small.messages(), &["0|12".to_string()]);
+        assert_eq!(large.messages(), &["1|0".to_string()]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn hook_with_output_larger_than_pipe_buffer_completes() {
+        let runner = HookRunner::new(RuntimeHookConfig::new(
+            vec![shell_snippet(
+                "i=0; while [ $i -lt 4096 ]; do printf '%064d' 0; i=$((i+1)); done",
+            )],
+            Vec::new(),
+            Vec::new(),
+        ));
+
+        let result = runner.run_pre_tool_use("Read", r#"{"path":"README.md"}"#);
+
+        assert!(!result.is_denied());
+        assert!(!result.is_failed());
+        assert_eq!(result.messages()[0].len(), 4096 * 64);
     }
 
     #[test]

@@ -1647,7 +1647,7 @@ fn run_remote_trigger(input: RemoteTriggerInput) -> Result<String, String> {
                 "method": method,
                 "status_code": status,
                 "body": truncated_body,
-                "success": status >= 200 && status < 300
+                "success": (200..300).contains(&status)
             }))
         }
         Err(e) => to_pretty_json(json!({
@@ -3144,7 +3144,7 @@ fn persist_agent_terminal_state(
     let mut next_manifest = manifest.clone();
     next_manifest.status = status.to_string();
     next_manifest.completed_at = Some(iso8601_now());
-    next_manifest.current_blocker = blocker.clone();
+    next_manifest.current_blocker.clone_from(&blocker);
     next_manifest.error = error;
     if let Some(blocker) = blocker {
         next_manifest.lane_events.push(LaneEvent {
@@ -4251,7 +4251,7 @@ fn resolve_repl_runtime(language: &str) -> Result<ReplRuntime, String> {
         "sh" | "shell" | "bash" => Ok(ReplRuntime {
             program: detect_first_command(&["bash", "sh"])
                 .ok_or_else(|| String::from("shell runtime not found"))?,
-            args: &["-lc"],
+            args: &["-c"],
         }),
         other => Err(format!("unsupported REPL language: {other}")),
     }
@@ -4583,25 +4583,61 @@ fn execute_powershell(input: PowerShellInput) -> std::io::Result<runtime::BashCo
 }
 
 fn detect_powershell_shell() -> std::io::Result<&'static str> {
-    if command_exists("pwsh") {
-        Ok("pwsh")
-    } else if command_exists("powershell") {
-        Ok("powershell")
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
-        ))
-    }
+    detect_powershell_shell_in(std::env::var_os("PATH").as_deref())
 }
 
+fn detect_powershell_shell_in(path: Option<&std::ffi::OsStr>) -> std::io::Result<&'static str> {
+    ["pwsh", "powershell"]
+        .into_iter()
+        .find(|shell| path.is_some_and(|path| find_executable_in(shell, path).is_some()))
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "PowerShell executable not found (expected `pwsh` or `powershell` in PATH)",
+            )
+        })
+}
+
+/// Resolves `command` against the current `PATH` without spawning a shell.
 fn command_exists(command: &str) -> bool {
-    std::process::Command::new("sh")
-        .arg("-lc")
-        .arg(format!("command -v {command} >/dev/null 2>&1"))
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    std::env::var_os("PATH").is_some_and(|path| find_executable_in(command, &path).is_some())
+}
+
+fn find_executable_in(command: &str, path: &std::ffi::OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .flat_map(|dir| executable_candidates(&dir, command))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(not(windows))]
+fn executable_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    vec![dir.join(command)]
+}
+
+#[cfg(windows)]
+fn executable_candidates(dir: &Path, command: &str) -> Vec<PathBuf> {
+    let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+    std::iter::once(dir.join(command))
+        .chain(
+            extensions
+                .split(';')
+                .filter(|extension| !extension.is_empty())
+                .map(|extension| dir.join(format!("{command}{extension}"))),
+        )
+        .collect()
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5182,8 +5218,14 @@ mod tests {
 
     #[test]
     fn web_search_extracts_and_filters_results() {
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /search?q=rust+web+search "));
+            assert!(
+                request_line.contains("GET /search?q=rust+web+search "),
+                "unexpected request line: {request_line:?}"
+            );
             HttpResponse::html(
                 200,
                 "OK",
@@ -5230,7 +5272,10 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let server = TestServer::spawn(Arc::new(|request_line: &str| {
-            assert!(request_line.contains("GET /fallback?q=generic+links "));
+            assert!(
+                request_line.contains("GET /fallback?q=generic+links "),
+                "unexpected request line: {request_line:?}"
+            );
             HttpResponse::html(
                 200,
                 "OK",
@@ -5434,7 +5479,9 @@ mod tests {
 
     #[test]
     fn skill_loads_local_skill_prompt() {
-        let _guard = env_lock().lock().expect("env lock should acquire");
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = temp_path("skills-home");
         let skill_dir = home.join(".agents").join("skills").join("help");
         fs::create_dir_all(&skill_dir).expect("skill dir should exist");
@@ -5605,6 +5652,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn agent_fake_runner_can_persist_completion_and_failure() {
         let _guard = env_lock()
             .lock()
@@ -6615,10 +6663,8 @@ printf 'pwsh:%s' "$1"
 
     #[test]
     fn powershell_errors_when_shell_is_missing() {
-        let _guard = env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let original_path = std::env::var("PATH").unwrap_or_default();
+        // Resolve against an isolated PATH instead of mutating the process-wide
+        // one, which would break every concurrently running test that spawns `sh`.
         let empty_dir = std::env::temp_dir().join(format!(
             "clawd-empty-bin-{}",
             std::time::SystemTime::now()
@@ -6627,15 +6673,32 @@ printf 'pwsh:%s' "$1"
                 .as_nanos()
         ));
         std::fs::create_dir_all(&empty_dir).expect("create empty dir");
-        std::env::set_var("PATH", empty_dir.display().to_string());
 
-        let err = execute_tool("PowerShell", &json!({"command": "Write-Output hello"}))
+        let err = super::detect_powershell_shell_in(Some(empty_dir.as_os_str()))
             .expect_err("PowerShell should fail when shell is missing");
-
-        std::env::set_var("PATH", original_path);
         let _ = std::fs::remove_dir_all(empty_dir);
 
-        assert!(err.contains("PowerShell executable not found"));
+        assert!(err.to_string().contains("PowerShell executable not found"));
+        assert!(super::detect_powershell_shell_in(None).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_executable_in_requires_execute_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_path("exec-lookup");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let tool = dir.join("mytool");
+        std::fs::write(&tool, "#!/bin/sh\n").expect("write tool");
+        let path = std::env::join_paths([dir.clone()]).expect("join paths");
+
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        assert!(super::find_executable_in("mytool", &path).is_none());
+
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        assert_eq!(super::find_executable_in("mytool", &path), Some(tool));
+        assert!(super::find_executable_in("missing", &path).is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn read_only_registry() -> super::GlobalToolRegistry {

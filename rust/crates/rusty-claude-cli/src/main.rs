@@ -1840,15 +1840,14 @@ impl RuntimeMcpState {
     }
 }
 
+type RuntimeMcpBootstrap = (
+    Option<Arc<Mutex<RuntimeMcpState>>>,
+    Vec<RuntimeToolDefinition>,
+);
+
 fn build_runtime_mcp_state(
     runtime_config: &runtime::RuntimeConfig,
-) -> Result<
-    (
-        Option<Arc<Mutex<RuntimeMcpState>>>,
-        Vec<RuntimeToolDefinition>,
-    ),
-    Box<dyn std::error::Error>,
-> {
+) -> Result<RuntimeMcpBootstrap, Box<dyn std::error::Error>> {
     let Some((mcp_state, discovery)) = RuntimeMcpState::new(runtime_config)? else {
         return Ok((None, Vec::new()));
     };
@@ -6800,7 +6799,9 @@ UU conflicted.rs",
 
     #[test]
     fn managed_sessions_default_to_jsonl_and_resolve_legacy_json() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let workspace = temp_workspace("session-resolution");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");
@@ -6838,7 +6839,9 @@ UU conflicted.rs",
 
     #[test]
     fn latest_session_alias_resolves_most_recent_managed_session() {
-        let _guard = cwd_lock().lock().expect("cwd lock");
+        let _guard = cwd_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let workspace = temp_workspace("latest-session-alias");
         std::fs::create_dir_all(&workspace).expect("workspace should create");
         let previous = std::env::current_dir().expect("cwd");

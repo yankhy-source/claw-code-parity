@@ -189,10 +189,10 @@ impl HookRunner {
         child.stderr(std::process::Stdio::piped());
         child.env("HOOK_EVENT", event.as_str());
         child.env("HOOK_TOOL_NAME", tool_name);
-        child.env("HOOK_TOOL_INPUT", tool_input);
+        set_payload_env(&mut child, "HOOK_TOOL_INPUT", tool_input);
         child.env("HOOK_TOOL_IS_ERROR", if is_error { "1" } else { "0" });
         if let Some(tool_output) = tool_output {
-            child.env("HOOK_TOOL_OUTPUT", tool_output);
+            set_payload_env(&mut child, "HOOK_TOOL_OUTPUT", tool_output);
         }
 
         match child.output_with_stdin(payload.as_bytes()) {
@@ -293,11 +293,25 @@ fn shell_command(command: &str) -> CommandWithStdin {
         CommandWithStdin::new(command_builder)
     } else {
         let mut command_builder = Command::new("sh");
-        command_builder.arg("-lc").arg(command);
+        command_builder.arg("-c").arg(command);
         CommandWithStdin::new(command_builder)
     };
 
     command_builder
+}
+
+/// Largest tool payload mirrored into a `HOOK_*` environment variable. Linux
+/// refuses to spawn a process whose single environment entry exceeds 128 KiB
+/// (`MAX_ARG_STRLEN`), so larger payloads are delivered on stdin only and the
+/// omission is flagged through `<NAME>_OMITTED=1`.
+const MAX_HOOK_ENV_PAYLOAD_BYTES: usize = 32 * 1024;
+
+fn set_payload_env(child: &mut CommandWithStdin, key: &str, value: &str) {
+    if value.len() <= MAX_HOOK_ENV_PAYLOAD_BYTES {
+        child.env(key, value);
+    } else {
+        child.env(format!("{key}_OMITTED"), "1");
+    }
 }
 
 struct CommandWithStdin {
@@ -335,9 +349,16 @@ impl CommandWithStdin {
 
     fn output_with_stdin(&mut self, stdin: &[u8]) -> std::io::Result<std::process::Output> {
         let mut child = self.command.spawn()?;
+        // Write the payload on a helper thread while `wait_with_output` drains
+        // stdout/stderr, so large payloads or outputs cannot deadlock on full
+        // pipes. A hook that exits without reading stdin closes the pipe early;
+        // the resulting broken pipe is expected and not a hook failure.
         if let Some(mut child_stdin) = child.stdin.take() {
-            use std::io::Write as _;
-            child_stdin.write_all(stdin)?;
+            let payload = stdin.to_vec();
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                let _ = child_stdin.write_all(&payload);
+            });
         }
         child.wait_with_output()
     }
@@ -451,6 +472,36 @@ mod tests {
         let _ = fs::remove_dir_all(config_home);
         let _ = fs::remove_dir_all(first_source_root);
         let _ = fs::remove_dir_all(second_source_root);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn large_payloads_reach_hooks_on_stdin_without_breaking_spawn() {
+        // given
+        let runner = HookRunner::new(crate::PluginHooks {
+            pre_tool_use: vec![
+                "printf '%s:%s' \"${HOOK_TOOL_INPUT_OMITTED:-0}\" \"$(wc -c)\"".to_string(),
+            ],
+            post_tool_use: vec!["printf 'ignored stdin'".to_string()],
+            post_tool_use_failure: Vec::new(),
+        });
+        let payload = format!(r#"{{"content":"{}"}}"#, "x".repeat(512 * 1024));
+
+        // when
+        let pre = runner.run_pre_tool_use("Write", &payload);
+        let post = runner.run_post_tool_use("Write", &payload, &payload, false);
+
+        // then
+        assert!(!pre.is_failed(), "{:?}", pre.messages());
+        let (omitted, stdin_bytes) = pre.messages()[0]
+            .split_once(':')
+            .expect("hook reports flag and byte count");
+        assert_eq!(omitted, "1");
+        assert!(stdin_bytes.trim().parse::<usize>().expect("byte count") > payload.len());
+        assert_eq!(
+            post,
+            HookRunResult::allow(vec!["ignored stdin".to_string()])
+        );
     }
 
     #[test]
