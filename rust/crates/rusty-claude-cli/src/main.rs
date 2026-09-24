@@ -3490,7 +3490,14 @@ fn handle_memory_slash_command(
         return render_memory_report();
     };
     let cwd = env::current_dir()?;
-    let store = MemoryStore::discover(&cwd);
+    run_memory_action(&MemoryStore::discover(&cwd), action, target)
+}
+
+fn run_memory_action(
+    store: &MemoryStore,
+    action: &str,
+    target: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let target = target.map(str::trim).filter(|target| !target.is_empty());
     match (action, target) {
         ("list", scope) => {
@@ -5713,22 +5720,22 @@ mod tests {
         format_permissions_report, format_permissions_switch_report, format_pr_report,
         format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
         format_ultraplan_report, format_unknown_slash_command,
-        format_unknown_slash_command_message, handle_memory_slash_command,
-        normalize_permission_mode, parse_args, parse_git_status_branch,
-        parse_git_status_metadata_for, parse_git_workspace_summary, permission_policy,
-        print_help_to, push_output_block, render_config_report, render_diff_report,
-        render_diff_report_for, render_memory_report, render_repl_help, render_resume_usage,
-        resolve_model_alias, resolve_session_reference, response_to_events,
-        resume_supported_slash_commands, run_resume_command,
-        slash_command_completion_candidates_with_sessions, status_context, validate_no_args,
-        write_mcp_server_fixture, CliAction, CliOutputFormat, CliToolExecutor, GitWorkspaceSummary,
-        InternalPromptProgressEvent, InternalPromptProgressState, LiveCli, SlashCommand,
-        StatusUsage, DEFAULT_MODEL,
+        format_unknown_slash_command_message, normalize_permission_mode, parse_args,
+        parse_git_status_branch, parse_git_status_metadata_for, parse_git_workspace_summary,
+        permission_policy, print_help_to, push_output_block, render_config_report,
+        render_diff_report, render_diff_report_for, render_durable_memory_summary,
+        render_memory_report, render_repl_help, render_resume_usage, resolve_model_alias,
+        resolve_session_reference, response_to_events, resume_supported_slash_commands,
+        run_memory_action, run_resume_command, slash_command_completion_candidates_with_sessions,
+        status_context, validate_no_args, write_mcp_server_fixture, CliAction, CliOutputFormat,
+        CliToolExecutor, GitWorkspaceSummary, InternalPromptProgressEvent,
+        InternalPromptProgressState, LiveCli, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use api::{MessageResponse, OutputContentBlock, Usage};
     use plugins::{
         PluginManager, PluginManagerConfig, PluginTool, PluginToolDefinition, PluginToolPermission,
     };
+    use runtime::MemoryStore;
     use runtime::{
         AssistantEvent, ConfigLoader, ContentBlock, ConversationMessage, MessageRole,
         PermissionMode, Session, ToolExecutor,
@@ -7036,25 +7043,21 @@ UU conflicted.rs",
 
     #[test]
     fn memory_slash_command_adds_searches_lists_and_forgets_notes() {
-        let _guard = cwd_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let workspace = temp_workspace("memory-command");
-        std::fs::create_dir_all(workspace.join(".git")).expect("workspace should create");
-        let previous = std::env::current_dir().expect("cwd");
-        let previous_config_home = std::env::var_os("CLAW_CONFIG_HOME");
-        std::env::set_var("CLAW_CONFIG_HOME", workspace.join("config-home"));
-        std::env::set_current_dir(&workspace).expect("switch cwd");
+        let store = MemoryStore::new(
+            Some(workspace.join("project")),
+            Some(workspace.join("user")),
+        );
 
-        let added = handle_memory_slash_command(Some("add"), Some("Vergabe PDFs live in aog-app"))
+        let added = run_memory_action(&store, "add", Some("Vergabe PDFs live in aog-app"))
             .expect("add should succeed");
         assert!(added.starts_with("Remembered [mem-"), "{added}");
-        let again = handle_memory_slash_command(Some("add"), Some("vergabe pdfs live in AOG-APP"))
+        let again = run_memory_action(&store, "add", Some("vergabe pdfs live in AOG-APP"))
             .expect("duplicate add should succeed");
         assert!(again.starts_with("Already remembered"), "{again}");
 
-        let search = handle_memory_slash_command(Some("search"), Some("vergabe"))
-            .expect("search should succeed");
+        let search =
+            run_memory_action(&store, "search", Some("vergabe")).expect("search should succeed");
         assert!(
             search.contains("(1 hits)") && search.contains("aog-app"),
             "{search}"
@@ -7066,27 +7069,19 @@ UU conflicted.rs",
             .expect("id in search output")
             .to_string();
 
-        let listed = handle_memory_slash_command(Some("list"), Some("project")).expect("list");
+        let listed = run_memory_action(&store, "list", Some("project")).expect("list");
         assert!(listed.contains(&id));
-        let report = handle_memory_slash_command(None, None).expect("report");
-        assert!(report.contains("Durable memory") && report.contains("project=1 user=0"));
-        assert!(handle_memory_slash_command(Some("list"), Some("team")).is_err());
-        assert!(
-            handle_memory_slash_command(Some("add"), Some("password: hunter2hunter2")).is_err()
-        );
-        assert!(handle_memory_slash_command(Some("help"), None)
+        let summary = render_durable_memory_summary(&store).join("\n");
+        assert!(summary.contains("Durable memory") && summary.contains("project=1 user=0"));
+        assert!(run_memory_action(&store, "list", Some("team")).is_err());
+        assert!(run_memory_action(&store, "add", Some("password: hunter2hunter2")).is_err());
+        assert!(run_memory_action(&store, "help", None)
             .expect("help")
             .contains("forget <id>"));
 
-        let forgot = handle_memory_slash_command(Some("forget"), Some(&id)).expect("forget");
+        let forgot = run_memory_action(&store, "forget", Some(&id)).expect("forget");
         assert!(forgot.starts_with(&format!("Forgot [{id}]")));
-        assert!(handle_memory_slash_command(Some("forget"), Some(&id)).is_err());
-
-        std::env::set_current_dir(previous).expect("restore cwd");
-        match previous_config_home {
-            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
-            None => std::env::remove_var("CLAW_CONFIG_HOME"),
-        }
+        assert!(run_memory_action(&store, "forget", Some(&id)).is_err());
         let _ = std::fs::remove_dir_all(workspace);
     }
 
@@ -7664,28 +7659,23 @@ fn write_mcp_server_fixture(script_path: &Path) {
             "import json, sys",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
+            "    while True:",
+            "        line = sys.stdin.buffer.readline()",
+            "        if not line:",
             "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            "            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "        if line.strip():",
+            "            return json.loads(line.decode())",
             "",
             "def send_message(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            r"    sys.stdout.buffer.write(json.dumps(message).encode() + b'\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
             "    request = read_message()",
             "    if request is None:",
             "        break",
+            "    if 'id' not in request:",
+            "        continue",
             "    method = request['method']",
             "    if method == 'initialize':",
             "        send_message({",

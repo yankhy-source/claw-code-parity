@@ -987,6 +987,17 @@ impl McpServerManager {
             }
 
             let server = self.server_mut(server_name)?;
+            if let Some(process) = server.process.as_mut() {
+                // The lifecycle requires this notification before any other request.
+                process
+                    .send_notification("notifications/initialized", None)
+                    .await
+                    .map_err(|source| McpServerManagerError::Transport {
+                        server_name: server_name.to_string(),
+                        method: "notifications/initialized",
+                        source,
+                    })?;
+            }
             server.initialized = true;
             return Ok(());
         }
@@ -1066,8 +1077,18 @@ impl McpStdioProcess {
         self.flush().await
     }
 
+    /// Reads one `Content-Length` framed (LSP-style) payload.
     pub async fn read_frame(&mut self) -> io::Result<Vec<u8>> {
-        let mut content_length = None;
+        self.read_framed_payload(None).await
+    }
+
+    /// Reads the rest of a `Content-Length` header block (optionally seeded
+    /// with a length from an already-consumed first header line) and then the
+    /// payload itself.
+    async fn read_framed_payload(
+        &mut self,
+        mut content_length: Option<usize>,
+    ) -> io::Result<Vec<u8>> {
         loop {
             let mut line = String::new();
             let bytes_read = self.stdout.read_line(&mut line).await?;
@@ -1077,18 +1098,12 @@ impl McpStdioProcess {
                     "MCP stdio stream closed while reading headers",
                 ));
             }
-            if line == "\r\n" {
+            let header = line.trim_end_matches(['\r', '\n']);
+            if header.is_empty() {
                 break;
             }
-            let header = line.trim_end_matches(['\r', '\n']);
-            if let Some((name, value)) = header.split_once(':') {
-                if name.trim().eq_ignore_ascii_case("Content-Length") {
-                    let parsed = value
-                        .trim()
-                        .parse::<usize>()
-                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-                    content_length = Some(parsed);
-                }
+            if let Some(length) = parse_content_length_header(header)? {
+                content_length = Some(length);
             }
         }
 
@@ -1100,16 +1115,74 @@ impl McpStdioProcess {
         Ok(payload)
     }
 
+    /// Reads the next JSON-RPC message payload. The MCP stdio transport is
+    /// newline-delimited JSON; `Content-Length` framed messages from legacy
+    /// servers are accepted as well, and non-JSON lines (servers that log to
+    /// stdout) are skipped.
+    async fn read_message_payload(&mut self) -> io::Result<Vec<u8>> {
+        loop {
+            let mut line = String::new();
+            let bytes_read = self.stdout.read_line(&mut line).await?;
+            if bytes_read == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "MCP stdio stream closed while reading message",
+                ));
+            }
+            let trimmed = line.trim();
+            if trimmed.starts_with('{') || trimmed.starts_with('[') {
+                return Ok(trimmed.as_bytes().to_vec());
+            }
+            if let Some(length) = parse_content_length_header(trimmed)? {
+                return self.read_framed_payload(Some(length)).await;
+            }
+        }
+    }
+
+    /// Writes one newline-delimited JSON-RPC message (MCP stdio transport).
     pub async fn write_jsonrpc_message<T: Serialize>(&mut self, message: &T) -> io::Result<()> {
-        let body = serde_json::to_vec(message)
+        // Compact serde_json output escapes control characters inside strings,
+        // so the encoded message never contains a raw newline.
+        let mut body = serde_json::to_vec(message)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        self.write_frame(&body).await
+        body.push(b'\n');
+        self.write_all(&body).await?;
+        self.flush().await
     }
 
     pub async fn read_jsonrpc_message<T: DeserializeOwned>(&mut self) -> io::Result<T> {
-        let payload = self.read_frame().await?;
+        let payload = self.read_message_payload().await?;
         serde_json::from_slice(&payload)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    /// Sends a JSON-RPC notification (a message without an id).
+    pub async fn send_notification(
+        &mut self,
+        method: &str,
+        params: Option<JsonValue>,
+    ) -> io::Result<()> {
+        let mut message = serde_json::json!({ "jsonrpc": "2.0", "method": method });
+        if let Some(params) = params {
+            message["params"] = params;
+        }
+        self.write_jsonrpc_message(&message).await
+    }
+
+    /// Answers a server-to-client request received while waiting for a
+    /// response: `ping` gets an empty result, everything else is rejected as
+    /// unsupported so the server is never left waiting.
+    async fn answer_server_request(&mut self, id: JsonValue, method: &str) -> io::Result<()> {
+        let reply = if method == "ping" {
+            serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+        } else {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": format!("method not supported by client: {method}") }
+            })
+        };
+        self.write_jsonrpc_message(&reply).await
     }
 
     pub async fn send_request<T: Serialize>(
@@ -1132,7 +1205,23 @@ impl McpStdioProcess {
         let method = method.into();
         let request = JsonRpcRequest::new(id.clone(), method.clone(), params);
         self.send_request(&request).await?;
-        let response = self.read_response().await?;
+        let response: JsonRpcResponse<TResult> = loop {
+            let payload = self.read_message_payload().await?;
+            let message: JsonValue = serde_json::from_slice(&payload)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            // Servers may interleave notifications (no id) and their own
+            // requests (id + method) before answering; neither is our response.
+            if let Some(server_method) = message.get("method").and_then(JsonValue::as_str) {
+                if let Some(server_request_id) = message.get("id") {
+                    let server_method = server_method.to_string();
+                    self.answer_server_request(server_request_id.clone(), &server_method)
+                        .await?;
+                }
+                continue;
+            }
+            break serde_json::from_value(message)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        };
 
         if response.jsonrpc != "2.0" {
             return Err(io::Error::new(
@@ -1241,6 +1330,32 @@ fn apply_env(command: &mut Command, env: &BTreeMap<String, String>) {
     }
 }
 
+/// Upper bound for a `Content-Length` framed payload, so a misbehaving server
+/// cannot make the client allocate unbounded memory.
+const MAX_FRAMED_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
+
+fn parse_content_length_header(header: &str) -> io::Result<Option<usize>> {
+    let Some((name, value)) = header.split_once(':') else {
+        return Ok(None);
+    };
+    if !name.trim().eq_ignore_ascii_case("Content-Length") {
+        return Ok(None);
+    }
+    let length = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if length > MAX_FRAMED_PAYLOAD_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "MCP frame of {length} bytes exceeds the {MAX_FRAMED_PAYLOAD_BYTES}-byte limit"
+            ),
+        ));
+    }
+    Ok(Some(length))
+}
+
 fn encode_frame(payload: &[u8]) -> Vec<u8> {
     let header = format!("Content-Length: {}\r\n\r\n", payload.len());
     let mut framed = header.into_bytes();
@@ -1267,7 +1382,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use serde_json::json;
     use tokio::runtime::Builder;
@@ -1320,18 +1435,10 @@ mod tests {
             "import json, os, sys",
             "LOWERCASE_CONTENT_LENGTH = os.environ.get('MCP_LOWERCASE_CONTENT_LENGTH') == '1'",
             "MISMATCHED_RESPONSE_ID = os.environ.get('MCP_MISMATCHED_RESPONSE_ID') == '1'",
-            "header = b''",
-            r"while not header.endswith(b'\r\n\r\n'):",
-            "    chunk = sys.stdin.buffer.read(1)",
-            "    if not chunk:",
-            "        raise SystemExit(1)",
-            "    header += chunk",
-            "length = 0",
-            r"for line in header.decode().split('\r\n'):",
-            r"    if line.lower().startswith('content-length:'):",
-            r"        length = int(line.split(':', 1)[1].strip())",
-            "payload = sys.stdin.buffer.read(length)",
-            "request = json.loads(payload.decode())",
+            "line = sys.stdin.buffer.readline()",
+            "if not line:",
+            "    raise SystemExit(1)",
+            "request = json.loads(line.decode())",
             r"assert request['jsonrpc'] == '2.0'",
             r"assert request['method'] == 'initialize'",
             "response_id = 'wrong-id' if MISMATCHED_RESPONSE_ID else request['id']",
@@ -1369,28 +1476,23 @@ mod tests {
             "INVALID_TOOL_CALL_RESPONSE = os.environ.get('MCP_INVALID_TOOL_CALL_RESPONSE') == '1'",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
+            "    while True:",
+            "        line = sys.stdin.buffer.readline()",
+            "        if not line:",
             "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "        if line.strip():",
+            "            return json.loads(line.decode())",
             "",
             "def send_message(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            r"    sys.stdout.buffer.write(json.dumps(message).encode() + b'\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
             "    request = read_message()",
             "    if request is None:",
             "        break",
+            "    if 'id' not in request:",
+            "        continue",
             "    method = request['method']",
             "    if method == 'initialize':",
             "        send_message({",
@@ -1522,28 +1624,23 @@ mod tests {
             "    return True",
             "",
             "def read_message():",
-            "    header = b''",
-            r"    while not header.endswith(b'\r\n\r\n'):",
-            "        chunk = sys.stdin.buffer.read(1)",
-            "        if not chunk:",
+            "    while True:",
+            "        line = sys.stdin.buffer.readline()",
+            "        if not line:",
             "            return None",
-            "        header += chunk",
-            "    length = 0",
-            r"    for line in header.decode().split('\r\n'):",
-            r"        if line.lower().startswith('content-length:'):",
-            r"            length = int(line.split(':', 1)[1].strip())",
-            "    payload = sys.stdin.buffer.read(length)",
-            "    return json.loads(payload.decode())",
+            "        if line.strip():",
+            "            return json.loads(line.decode())",
             "",
             "def send_message(message):",
-            "    payload = json.dumps(message).encode()",
-            r"    sys.stdout.buffer.write(f'Content-Length: {len(payload)}\r\n\r\n'.encode() + payload)",
+            r"    sys.stdout.buffer.write(json.dumps(message).encode() + b'\n')",
             "    sys.stdout.buffer.flush()",
             "",
             "while True:",
             "    request = read_message()",
             "    if request is None:",
             "        break",
+            "    if 'id' not in request:",
+            "        continue",
             "    method = request['method']",
             "    log(method)",
             "    if method == 'initialize':",
@@ -2058,6 +2155,111 @@ mod tests {
         });
     }
 
+    fn write_strict_spec_mcp_server_script() -> PathBuf {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("temp dir");
+        let script_path = root.join("strict-mcp-server.py");
+        let script = [
+            "#!/usr/bin/env python3",
+            "import json, sys",
+            "",
+            "def send(message):",
+            "    sys.stdout.write(json.dumps(message) + '\\n')",
+            "    sys.stdout.flush()",
+            "",
+            "def read():",
+            "    line = sys.stdin.readline()",
+            "    if not line:",
+            "        raise SystemExit(0)",
+            "    if line.lower().startswith('content-length'):",
+            "        sys.stderr.write('client used LSP framing\\n')",
+            "        raise SystemExit(3)",
+            "    return json.loads(line)",
+            "",
+            "sys.stdout.write('strict server booting (not JSON, must be skipped)\\n')",
+            "sys.stdout.flush()",
+            "initialized = False",
+            "while True:",
+            "    message = read()",
+            "    method = message.get('method')",
+            "    if method == 'initialize':",
+            "        send({'jsonrpc': '2.0', 'id': message['id'], 'result': {",
+            "            'protocolVersion': message['params']['protocolVersion'],",
+            "            'capabilities': {'tools': {}},",
+            "            'serverInfo': {'name': 'strict', 'version': '1.0.0'}}})",
+            "    elif method == 'notifications/initialized':",
+            "        initialized = True",
+            "    elif method == 'tools/list':",
+            "        if not initialized:",
+            "            send({'jsonrpc': '2.0', 'id': message['id'], 'error': {",
+            "                'code': -32002, 'message': 'initialized notification missing'}})",
+            "            continue",
+            "        send({'jsonrpc': '2.0', 'method': 'notifications/message',",
+            "              'params': {'level': 'info', 'data': 'listing\\ntools'}})",
+            "        send({'jsonrpc': '2.0', 'id': 'srv-ping', 'method': 'ping'})",
+            "        pong = read()",
+            "        if pong.get('id') != 'srv-ping' or pong.get('result') != {}:",
+            "            raise SystemExit(4)",
+            "        send({'jsonrpc': '2.0', 'id': message['id'], 'result': {'tools': [",
+            "            {'name': 'echo', 'description': 'multi\\nline', 'inputSchema': {'type': 'object'}}]}})",
+            "    elif 'id' in message:",
+            "        send({'jsonrpc': '2.0', 'id': message['id'], 'error': {",
+            "            'code': -32601, 'message': 'unknown'}})",
+            "",
+        ]
+        .join("\n");
+        fs::write(&script_path, script).expect("write script");
+        let mut permissions = fs::metadata(&script_path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&script_path, permissions).expect("chmod");
+        script_path
+    }
+
+    #[test]
+    fn manager_speaks_newline_delimited_mcp_to_spec_enforcing_servers() {
+        let runtime = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let script_path = write_strict_spec_mcp_server_script();
+            let root = script_path.parent().expect("script parent");
+            let log_path = root.join("strict.log");
+            let servers = BTreeMap::from([(
+                "strict".to_string(),
+                manager_server_config(&script_path, "strict", &log_path),
+            )]);
+            let mut manager = McpServerManager::from_servers(&servers);
+
+            let tools = manager
+                .discover_tools()
+                .await
+                .expect("spec-compliant server should be discoverable");
+
+            assert_eq!(tools.len(), 1);
+            assert_eq!(tools[0].raw_name, "echo");
+            assert_eq!(tools[0].tool.description.as_deref(), Some("multi\nline"));
+
+            manager.shutdown().await.expect("shutdown");
+            cleanup_script(&script_path);
+        });
+    }
+
+    #[test]
+    fn rejects_oversized_content_length_frames() {
+        let error = super::parse_content_length_header("Content-Length: 999999999999")
+            .expect_err("oversized frame must be rejected");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(
+            super::parse_content_length_header("content-length: 12").expect("parse"),
+            Some(12)
+        );
+        assert_eq!(
+            super::parse_content_length_header("Content-Type: x").expect("parse"),
+            None
+        );
+    }
+
     #[test]
     fn manager_discovers_tools_from_stdio_config() {
         let runtime = Builder::new_current_thread()
@@ -2260,8 +2462,7 @@ mod tests {
     }
 
     #[test]
-    fn given_child_exits_after_discovery_when_calling_twice_then_second_call_succeeds_after_reset()
-    {
+    fn given_child_exits_after_discovery_when_calling_then_manager_respawns_before_sending() {
         let runtime = Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2282,25 +2483,20 @@ mod tests {
             let mut manager = McpServerManager::from_servers(&servers);
 
             manager.discover_tools().await.expect("discover tools");
-            let first_error = manager
-                .call_tool(
-                    &mcp_tool_name("alpha", "echo"),
-                    Some(json!({"text": "reconnect"})),
-                )
-                .await
-                .expect_err("first call should fail after transport drops");
-
-            match first_error {
-                McpServerManagerError::Transport {
-                    server_name,
-                    method,
-                    source,
-                } => {
-                    assert_eq!(server_name, "alpha");
-                    assert_eq!(method, "tools/call");
-                    assert_eq!(source.kind(), ErrorKind::UnexpectedEof);
-                }
-                other => panic!("expected transport error, got {other:?}"),
+            // Wait until the fixture has really exited so the outcome does not
+            // depend on scheduling: the manager must notice the dead child and
+            // respawn it before sending. (A child that dies mid-call is covered
+            // by the tool_call_disconnect test.)
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !manager
+                .server_process_exited("alpha")
+                .expect("exit check should succeed")
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "fixture should exit after tools/list"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
 
             let response = manager
@@ -2309,7 +2505,7 @@ mod tests {
                     Some(json!({"text": "reconnect"})),
                 )
                 .await
-                .expect("second tool call should succeed after reset");
+                .expect("tool call should succeed after the manager respawns the server");
 
             assert_eq!(
                 response
